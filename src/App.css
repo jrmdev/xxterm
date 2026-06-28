@@ -1,0 +1,393 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: Arial, sans-serif;
+  scrollbar-width: thin;
+  scrollbar-color: var(--app-scrollbar) var(--app-background);
+}
+
+.tab-bar {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--app-background);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--app-background);
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--app-scrollbar);
+  border: 2px solid var(--app-background);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--app-muted);
+}
+
+.xterm,
+.xterm .xterm-screen,
+.xterm .xterm-rows,
+.xterm .xterm-viewport,
+.xterm .xterm-helper-textarea {
+  background: var(--terminal-background) !important;
+  background-color: var(--terminal-background) !important;
+}
+
+.xterm {
+  padding: 4px 0 2px 4px;
+  height: 100%;
+}
+
+.xterm-viewport {
+  scrollbar-width: thin;
+  scrollbar-color: var(--app-scrollbar) var(--terminal-background);
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: var(--terminal-background);
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background-color: var(--app-scrollbar);
+  border: 2px solid var(--terminal-background);
+}
+
+:root {
+  --app-background: #1e1e1e;
+  --app-surface: #1e1e1e;
+  --app-surface-alt: #2d2d2d;
+  --app-surface-hover: #3a3a3a;
+  --app-border: #444444;
+  --app-border-muted: rgba(255, 255, 255, 0.1);
+  --app-text: #cccccc;
+  --app-muted: #98a2b3;
+  --app-subtle: #666666;
+  --app-empty: #555555;
+  --app-accent: #4ea1ff;
+  --app-accent-hover: #3d8ee6;
+  --app-danger: #e06c75;
+  --app-success: #98c379;
+  --app-warning: #dcdcaa;
+  --app-selection: #31343a;
+  --app-overlay: rgba(0, 0, 0, 0.56);
+  --app-input: #2b2b2b;
+  --app-input-border: #404040;
+  --app-progress-track: #2c2c2c;
+  --app-scrollbar: #5c5c5c;
+  --terminal-background: #1e1e1e;
+  --form-surface: var(--app-input);
+  --form-surface-hover: var(--app-surface-hover);
+  --form-surface-border: var(--app-border-muted);
+  --form-surface-border-focus: var(--app-accent);
+  --form-text: #eef2ff;
+  --form-muted: #98a2b3;
+  --form-accent: #4ea1ff;
+  --form-danger: #ff7b8a;
+  --form-success: #72d5a4;
+  --form-mono: "Cascadia Code", "JetBrains Mono", "Fira Code", "Consolas", "Liberation Mono", monospace;
+}
+
+.form-panel {
+  background: var(--app-surface);
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  color: var(--form-text);
+}
+
+.form-panel--scrollable {
+  max-height: 80vh;
+  overflow: auto;
+}
+
+.form-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.form-panel__title {
+  margin: 0;
+  color: var(--form-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.form-panel__eyebrow {
+  color: var(--form-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.form-section {
+  margin-bottom: 12px;
+}
+
+.form-section__title {
+  color: var(--form-muted);
+  font-size: 11px;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.form-field {
+  margin-bottom: 14px;
+}
+
+.form-label {
+  display: block;
+  color: var(--form-muted);
+  font-size: 11px;
+  font-weight: 400;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.form-help {
+  color: var(--form-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.form-input,
+.form-select {
+  width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--form-surface-border);
+  background: var(--form-surface);
+  color: var(--form-text);
+  font-family: var(--form-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  box-sizing: border-box;
+  outline: none;
+  font-weight: 400;
+  transition: border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.form-input:hover,
+.form-select:hover {
+  background-color: var(--form-surface-hover);
+}
+
+.form-input:focus-visible,
+.form-select:focus-visible {
+  border-color: var(--form-surface-border-focus);
+  box-shadow: 0 0 0 4px rgba(78, 161, 255, 0.16);
+  background-color: var(--form-surface-hover);
+}
+
+.form-input::placeholder {
+  color: rgba(152, 162, 179, 0.68);
+  opacity: 1;
+}
+
+.form-input--compact {
+  min-height: 30px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.form-select {
+  appearance: none;
+  padding-right: 34px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, rgba(238, 242, 255, 0.68) 50%),
+    linear-gradient(135deg, rgba(238, 242, 255, 0.68) 50%, transparent 50%);
+  background-position:
+    calc(100% - 18px) 14px,
+    calc(100% - 12px) 14px;
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+}
+
+.form-button {
+  min-height: 32px;
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.form-button:hover:not(:disabled) {
+  background: var(--form-surface-hover);
+}
+
+.form-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.form-button--primary {
+  color: #ffffff;
+  background: var(--app-accent);
+}
+
+.form-button--primary:hover:not(:disabled) {
+  background: var(--app-accent-hover);
+}
+
+.form-button--secondary {
+  color: var(--form-text);
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.form-button--secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.form-button--danger {
+  color: #fff;
+  background: var(--app-danger);
+}
+
+.form-button--danger:hover:not(:disabled) {
+  background: var(--app-danger);
+}
+
+.form-icon-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--form-text);
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+
+.form-icon-button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.12);
+  transform: translateY(-1px);
+}
+
+.form-error {
+  color: var(--form-danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.form-success {
+  color: var(--form-success);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.form-row > * {
+  min-width: 0;
+}
+
+.form-checkbox {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--form-accent);
+}
+
+.form-checkbox-label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  cursor: pointer;
+  color: var(--form-text);
+  font-family: var(--form-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  font-weight: 400;
+}
+
+.sftp-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 26px;
+  color: var(--form-accent);
+  font-size: 13px;
+  line-height: 1;
+  animation: sftp-spin 900ms linear infinite;
+}
+
+.sftp-progress-fill {
+  height: 100%;
+  transition: width 0.15s ease;
+}
+
+.sftp-progress-fill--indeterminate {
+  min-width: 38%;
+  transition: none;
+  animation: sftp-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+.sftp-transfer-cancel-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--app-muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.sftp-transfer-cancel-btn:hover {
+  background: color-mix(in srgb, var(--app-danger) 18%, transparent);
+  color: var(--app-danger);
+}
+
+@keyframes sftp-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes sftp-progress-indeterminate {
+  from {
+    transform: translateX(-120%);
+  }
+
+  to {
+    transform: translateX(270%);
+  }
+}
