@@ -1,5 +1,6 @@
 import { createStore } from "solid-js/store";
 import { getDefaultTerminalProfile, type TerminalProfile } from "./terminalProfiles";
+import type { KeyPassphraseInput } from "../ipc/commands";
 
 export interface Terminal {
   id: string;
@@ -7,6 +8,7 @@ export interface Terminal {
   type: "local" | "ssh";
   sessionId?: number;
   profile?: TerminalProfile;
+  keyPassphrases?: KeyPassphraseInput[];
   connectionState: "connecting" | "connected" | "disconnected";
   hasUnseenActivity: boolean;
   hasExited: boolean;
@@ -27,7 +29,7 @@ function nextProfileLabel(profile: TerminalProfile): string {
   return `${profile.name} ${next}`;
 }
 
-export function addTerminal(label?: string, type?: "local" | "ssh", sessionId?: number, profile?: TerminalProfile): string {
+export function addTerminal(label?: string, type?: "local" | "ssh", sessionId?: number, profile?: TerminalProfile, keyPassphrases?: KeyPassphraseInput[]): string {
   const id = `term-${nextId++}`;
   const terminalType = type || "local";
   const terminalProfile = terminalType === "local" ? profile ?? getDefaultTerminalProfile() : undefined;
@@ -37,6 +39,7 @@ export function addTerminal(label?: string, type?: "local" | "ssh", sessionId?: 
     type: terminalType,
     sessionId,
     profile: terminalProfile,
+    keyPassphrases: terminalType === "ssh" ? keyPassphrases : undefined,
     connectionState: terminalType === "ssh" ? "connecting" : "connected",
     hasUnseenActivity: false,
     hasExited: false,

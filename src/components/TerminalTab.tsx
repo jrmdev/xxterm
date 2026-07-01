@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { createPty, writePty, closePty, resizePty, connectSsh, readClipboard } from "../ipc/commands";
+import { createPty, writePty, closePty, resizePty, connectSsh, readClipboard, type KeyPassphraseInput } from "../ipc/commands";
 import { autoStartPortForwards, autoStopPortForwards } from "../stores/sessions";
 import { removeTerminal, setTerminalConnectionState, setTerminalUnseenActivity, setTerminalExited } from "../stores/terminals";
 import { clearSftpView, setSidebarPane, syncSidebarWithActiveTerminal } from "../stores/fileBrowser";
@@ -73,6 +73,7 @@ interface Props {
   type?: "local" | "ssh";
   sessionId?: number;
   profile?: TerminalProfile;
+  keyPassphrases?: KeyPassphraseInput[];
   active: boolean;
 }
 
@@ -473,9 +474,9 @@ export default function TerminalTab(props: Props) {
           const { cols: c, rows: r } = getTerminalSize();
           setTerminalConnectionState(props.id, "connecting");
           setSidebarPane("sftp");
-          await connectSsh(props.id, props.sessionId, c, r);
+          await connectSsh(props.id, props.sessionId, c, r, props.keyPassphrases);
           setTerminalConnectionState(props.id, "connected");
-          void autoStartPortForwards(props.sessionId, props.id);
+          void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
         } else {
           const { cols, rows } = getTerminalSize();
           await createPty(props.id, cols, rows, props.profile);
@@ -501,9 +502,9 @@ export default function TerminalTab(props: Props) {
         const { cols: c, rows: r } = getTerminalSize();
         setTerminalConnectionState(props.id, "connecting");
         setSidebarPane("sftp");
-        await connectSsh(props.id, props.sessionId, c, r);
+        await connectSsh(props.id, props.sessionId, c, r, props.keyPassphrases);
         setTerminalConnectionState(props.id, "connected");
-        void autoStartPortForwards(props.sessionId, props.id);
+        void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
       } else {
         const { cols, rows } = getTerminalSize();
         await createPty(props.id, cols, rows, props.profile);

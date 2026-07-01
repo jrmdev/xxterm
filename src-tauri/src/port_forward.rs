@@ -579,6 +579,7 @@ pub async fn restart_forward_if_running(
     if !has_transport {
         ssh::connect_ssh_headless(
             updated.session_id,
+            None,
             master_pwd_state,
             ssh_state,
             session_store,
@@ -994,6 +995,7 @@ pub async fn run_dynamic_forward(
 #[tauri::command]
 pub async fn start_port_forwards(
     session_id: i64,
+    key_passphrases: Option<Vec<ssh::KeyPassphraseInput>>,
     pf_state: tauri::State<'_, PortForwardState>,
     master_pwd_state: tauri::State<'_, MasterPasswordState>,
     ssh_state: tauri::State<'_, SshState>,
@@ -1010,6 +1012,7 @@ pub async fn start_port_forwards(
     if !has_transport {
         ssh::connect_ssh_headless(
             session_id,
+            key_passphrases,
             &master_pwd_state,
             &ssh_state,
             &session_store,
@@ -1036,6 +1039,7 @@ pub async fn start_port_forwards(
 pub async fn auto_start_port_forwards(
     session_id: i64,
     terminal_id: String,
+    key_passphrases: Option<Vec<ssh::KeyPassphraseInput>>,
     pf_state: tauri::State<'_, PortForwardState>,
     master_pwd_state: tauri::State<'_, MasterPasswordState>,
     ssh_state: tauri::State<'_, SshState>,
@@ -1060,6 +1064,7 @@ pub async fn auto_start_port_forwards(
     if !has_transport {
         ssh::connect_ssh_headless(
             session_id,
+            key_passphrases,
             &master_pwd_state,
             &ssh_state,
             &session_store,
@@ -1123,6 +1128,7 @@ pub async fn auto_stop_port_forwards(
 pub async fn start_single_port_forward(
     session_id: i64,
     forward_id: i64,
+    key_passphrases: Option<Vec<ssh::KeyPassphraseInput>>,
     pf_state: tauri::State<'_, PortForwardState>,
     master_pwd_state: tauri::State<'_, MasterPasswordState>,
     ssh_state: tauri::State<'_, SshState>,
@@ -1144,6 +1150,7 @@ pub async fn start_single_port_forward(
     if !has_transport {
         ssh::connect_ssh_headless(
             session_id,
+            key_passphrases,
             &master_pwd_state,
             &ssh_state,
             &session_store,

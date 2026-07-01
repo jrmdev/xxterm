@@ -344,14 +344,14 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn list_encrypted_password_ids(&self) -> Result<Vec<i64>, String> {
+    pub fn list_encrypted_secret_ids(&self) -> Result<Vec<(String, i64)>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
-        let prefix = "encrypted_pwd_";
+        let prefixes = ["encrypted_pwd_", "encrypted_key_passphrase_"];
         let mut stmt = conn
-            .prepare("SELECT key FROM settings WHERE key LIKE ?1")
+            .prepare("SELECT key FROM settings WHERE key LIKE 'encrypted_pwd_%' OR key LIKE 'encrypted_key_passphrase_%'")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![format!("{}%", prefix)], |row| {
+            .query_map([], |row| {
                 let key: String = row.get(0)?;
                 Ok(key)
             })
@@ -359,9 +359,12 @@ impl SessionStore {
         let mut ids = Vec::new();
         for row in rows {
             let key = row.map_err(|e| e.to_string())?;
-            if let Some(id_str) = key.strip_prefix(prefix) {
-                if let Ok(id) = id_str.parse::<i64>() {
-                    ids.push(id);
+            for prefix in prefixes {
+                if let Some(id_str) = key.strip_prefix(prefix) {
+                    if let Ok(id) = id_str.parse::<i64>() {
+                        ids.push((prefix.to_string(), id));
+                    }
+                    break;
                 }
             }
         }

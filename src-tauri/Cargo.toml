@@ -1,6 +1,6 @@
 [package]
 name = "xxterm"
-version = "1.1.0"
+version = "1.2.0"
 description = "xxterm - cross-platform terminal emulator"
 authors = ["you"]
 edition = "2021"
@@ -27,7 +27,7 @@ ring = "0.17"
 dirs = "5"
 chrono = "0.4"
 futures = "0.3"
-russh = { version = "0.61", default-features = false, features = ["ring"] }
+russh = { version = "0.61", default-features = false, features = ["ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util", "net", "time"] }
 anyhow = "1"
 russh-sftp = "2.1"

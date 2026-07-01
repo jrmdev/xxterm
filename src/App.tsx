@@ -11,6 +11,7 @@ import "./App.css";
 const SessionEditPanel = lazy(() => import("./components/SessionEditPanel"));
 const SettingsPanel = lazy(() => import("./components/SettingsPanel"));
 const MasterPasswordPrompt = lazy(() => import("./components/MasterPasswordPrompt"));
+const PrivateKeyPassphrasePrompt = lazy(() => import("./components/PrivateKeyPassphrasePrompt"));
 const PortForwardForm = lazy(() => import("./components/PortForwardForm"));
 
 function isEditableTarget(target: EventTarget | null) {
@@ -63,6 +64,9 @@ function App() {
         </Show>
         <Show when={sessions.masterPasswordPrompt}>
           <MasterPasswordPrompt />
+        </Show>
+        <Show when={sessions.keyPassphrasePrompt}>
+          <PrivateKeyPassphrasePrompt />
         </Show>
         <Show when={portForwards.showPanel}>
           <PortForwardForm />

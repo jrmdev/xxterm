@@ -10,6 +10,7 @@ use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, HashAlg};
 use russh::ChannelMsg;
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::copy_bidirectional;
 use tokio::sync::Mutex as AsyncMutex;
@@ -26,6 +27,13 @@ pub type SharedSshHandle = Arc<AsyncMutex<client::Handle<SshHandler>>>;
 type DynamicAgentClient = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
 
 const HEADLESS_SSH_ID_PREFIX: &str = "__port_forward__";
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPassphraseInput {
+    pub session_id: i64,
+    pub passphrase: String,
+}
 
 pub struct RemoteForwardMap {
     pub by_port: Mutex<HashMap<(String, u32), String>>,
@@ -234,15 +242,20 @@ async fn connect_ssh_agent() -> Result<DynamicAgentClient, String> {
     Err("SSH agent auth is not supported on this platform".to_string())
 }
 
-async fn best_agent_hash_alg(
+async fn best_rsa_hash_alg(
     ssh_session: &client::Handle<SshHandler>,
-    identity: &AgentIdentity,
+    algorithm: &Algorithm,
+    log_context: &str,
 ) -> Option<HashAlg> {
-    if matches!(identity.public_key().algorithm(), Algorithm::Rsa { .. }) {
+    if matches!(algorithm, Algorithm::Rsa { .. }) {
         match ssh_session.best_supported_rsa_hash().await {
             Ok(hash_alg) => hash_alg.flatten(),
             Err(err) => {
-                log::warn!("ssh agent: failed to query server RSA algorithms: {}", err);
+                log::warn!(
+                    "{}: failed to query server RSA algorithms: {}",
+                    log_context,
+                    err
+                );
                 None
             }
         }
@@ -269,7 +282,8 @@ async fn authenticate_with_agent(
     let mut last_error = None;
 
     for identity in identities {
-        let hash_alg = best_agent_hash_alg(ssh_session, &identity).await;
+        let identity_algorithm = identity.public_key().algorithm();
+        let hash_alg = best_rsa_hash_alg(ssh_session, &identity_algorithm, "ssh agent").await;
         let auth_result = match identity {
             AgentIdentity::PublicKey { key, .. } => ssh_session
                 .authenticate_publickey_with(username, key, hash_alg, &mut agent)
@@ -308,6 +322,7 @@ struct ResolvedSession {
     agent_forwarding: bool,
     password: Option<String>,
     private_key_path: Option<String>,
+    key_passphrase: Option<String>,
     startup_command: Option<String>,
 }
 
@@ -449,15 +464,22 @@ fn resolve_connection_chain(
     master_pwd_state: &MasterPasswordState,
     session_store: &SessionStore,
     startup_command: Option<String>,
+    key_passphrases: Option<Vec<KeyPassphraseInput>>,
 ) -> Result<Vec<ResolvedSession>, String> {
     let sessions = resolve_session_chain(target_session_id, session_store)?;
     let target_index = sessions.len().saturating_sub(1);
+    let key_passphrases: HashMap<i64, String> = key_passphrases
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| (item.session_id, item.passphrase))
+        .collect();
 
     sessions
         .into_iter()
         .enumerate()
         .map(|(index, session)| {
             let password = resolve_session_password(&session, master_pwd_state, session_store)?;
+            let key_passphrase = key_passphrases.get(&session.id).cloned();
             Ok(ResolvedSession {
                 name: session.name.clone(),
                 host: session.host,
@@ -467,6 +489,7 @@ fn resolve_connection_chain(
                 agent_forwarding: session.agent_forwarding,
                 password,
                 private_key_path: session.private_key_path,
+                key_passphrase,
                 startup_command: if index == target_index {
                     startup_command.clone()
                 } else {
@@ -569,28 +592,32 @@ async fn connect_authenticated_session(
             }
         },
         "key" => match session.private_key_path.as_ref() {
-            Some(path) => match russh::keys::load_secret_key(path, None) {
-                Ok(key) => {
-                    use russh::keys::PrivateKeyWithHashAlg;
-                    ssh_session
-                        .authenticate_publickey(
-                            &session.username,
-                            PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                        )
-                        .await
+            Some(path) => {
+                match russh::keys::load_secret_key(path, session.key_passphrase.as_deref()) {
+                    Ok(key) => {
+                        use russh::keys::PrivateKeyWithHashAlg;
+                        let algorithm = key.algorithm();
+                        let hash_alg = best_rsa_hash_alg(&ssh_session, &algorithm, "ssh key").await;
+                        ssh_session
+                            .authenticate_publickey(
+                                &session.username,
+                                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                            )
+                            .await
+                    }
+                    Err(e) => {
+                        emit_ssh_error(
+                            handle,
+                            sid,
+                            format!(
+                                "Failed to load private key for session {}: {}",
+                                session.name, e
+                            ),
+                        );
+                        return Err(());
+                    }
                 }
-                Err(e) => {
-                    emit_ssh_error(
-                        handle,
-                        sid,
-                        format!(
-                            "Failed to load private key for session {}: {}",
-                            session.name, e
-                        ),
-                    );
-                    return Err(());
-                }
-            },
+            }
             None => {
                 emit_ssh_error(
                     handle,
@@ -886,6 +913,7 @@ pub async fn connect_ssh(
     session_id: i64,
     cols: u16,
     rows: u16,
+    key_passphrases: Option<Vec<KeyPassphraseInput>>,
     master_pwd_state: tauri::State<'_, MasterPasswordState>,
     state: tauri::State<'_, SshState>,
     session_store: tauri::State<'_, SessionStore>,
@@ -897,6 +925,7 @@ pub async fn connect_ssh(
         &master_pwd_state,
         &session_store,
         session.startup_command.clone(),
+        key_passphrases,
     )?;
     let exit_requested = Arc::new(AtomicBool::new(false));
 
@@ -927,6 +956,7 @@ pub async fn connect_ssh(
 
 pub async fn connect_ssh_headless(
     session_id: i64,
+    key_passphrases: Option<Vec<KeyPassphraseInput>>,
     master_pwd_state: &MasterPasswordState,
     state: &SshState,
     session_store: &SessionStore,
@@ -948,16 +978,21 @@ pub async fn connect_ssh_headless(
         }
     }
 
-    let connection_chain =
-        match resolve_connection_chain(session_id, master_pwd_state, session_store, None) {
-            Ok(chain) => chain,
-            Err(err) => {
-                if let Ok(mut headless) = state.headless_sessions.lock() {
-                    headless.remove(&session_id);
-                }
-                return Err(err);
+    let connection_chain = match resolve_connection_chain(
+        session_id,
+        master_pwd_state,
+        session_store,
+        None,
+        key_passphrases,
+    ) {
+        Ok(chain) => chain,
+        Err(err) => {
+            if let Ok(mut headless) = state.headless_sessions.lock() {
+                headless.remove(&session_id);
             }
-        };
+            return Err(err);
+        }
+    };
 
     let headless_id = headless_ssh_id(session_id);
     let exit_requested = Arc::new(AtomicBool::new(false));

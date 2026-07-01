@@ -419,7 +419,7 @@ export default function TerminalPane() {
               }}
             >
               <Suspense>
-                <TerminalTab id={tab.id} label={tab.label} type={tab.type} sessionId={tab.sessionId} profile={tab.profile} active={terminals.activeId === tab.id} />
+                <TerminalTab id={tab.id} label={tab.label} type={tab.type} sessionId={tab.sessionId} profile={tab.profile} keyPassphrases={tab.keyPassphrases} active={terminals.activeId === tab.id} />
               </Suspense>
             </div>
           )}

@@ -10,6 +10,7 @@ const KEY_LEN: usize = 32;
 const VERIFICATION_PLAINTEXT: &[u8] = b"xxterm-master-verify";
 pub const SETTINGS_MASTER_KEY: &str = "master_password";
 pub const SETTINGS_PWD_PREFIX: &str = "encrypted_pwd_";
+pub const SETTINGS_KEY_PASSPHRASE_PREFIX: &str = "encrypted_key_passphrase_";
 #[allow(dead_code)]
 pub const SETTINGS_FONT_FAMILY: &str = "font_family";
 #[allow(dead_code)]
@@ -179,12 +180,12 @@ pub fn change_master_password(
 ) -> Result<(), String> {
     unlock_master_password(store, state, old_password)?;
 
-    let session_ids = store.list_encrypted_password_ids()?;
+    let encrypted_ids = store.list_encrypted_secret_ids()?;
 
-    let mut password_map: Vec<(i64, String)> = Vec::new();
-    for id in &session_ids {
-        match get_encrypted_password_internal(store, state, *id) {
-            Ok(pwd) => password_map.push((*id, pwd)),
+    let mut secret_map: Vec<(String, i64, String)> = Vec::new();
+    for (prefix, id) in &encrypted_ids {
+        match get_encrypted_secret_internal(store, state, prefix, *id) {
+            Ok(secret) => secret_map.push((prefix.clone(), *id, secret)),
             Err(_) => continue,
         }
     }
@@ -200,13 +201,10 @@ pub fn change_master_password(
     let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
     store.set_setting(SETTINGS_MASTER_KEY, &encoded)?;
 
-    for (session_id, pwd) in &password_map {
-        let encrypted = encrypt_with_key(pwd.as_bytes(), &new_key)?;
-        let pwd_encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted);
-        store.set_setting(
-            &format!("{}{}", SETTINGS_PWD_PREFIX, session_id),
-            &pwd_encoded,
-        )?;
+    for (prefix, session_id, secret) in &secret_map {
+        let encrypted = encrypt_with_key(secret.as_bytes(), &new_key)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+        store.set_setting(&format!("{}{}", prefix, session_id), &encoded)?;
     }
 
     state.set_key(new_key)?;
@@ -219,10 +217,35 @@ pub fn encrypt_and_store_password(
     session_id: i64,
     password: &str,
 ) -> Result<(), String> {
+    encrypt_and_store_secret(store, state, SETTINGS_PWD_PREFIX, session_id, password)
+}
+
+pub fn encrypt_and_store_key_passphrase(
+    store: &crate::session_store::SessionStore,
+    state: &MasterPasswordState,
+    session_id: i64,
+    passphrase: &str,
+) -> Result<(), String> {
+    encrypt_and_store_secret(
+        store,
+        state,
+        SETTINGS_KEY_PASSPHRASE_PREFIX,
+        session_id,
+        passphrase,
+    )
+}
+
+fn encrypt_and_store_secret(
+    store: &crate::session_store::SessionStore,
+    state: &MasterPasswordState,
+    prefix: &str,
+    session_id: i64,
+    secret: &str,
+) -> Result<(), String> {
     let key = state.get_key()?;
-    let encrypted = encrypt_with_key(password.as_bytes(), &key)?;
+    let encrypted = encrypt_with_key(secret.as_bytes(), &key)?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted);
-    store.set_setting(&format!("{}{}", SETTINGS_PWD_PREFIX, session_id), &encoded)?;
+    store.set_setting(&format!("{}{}", prefix, session_id), &encoded)?;
     Ok(())
 }
 
@@ -239,11 +262,28 @@ fn get_encrypted_password_internal(
     state: &MasterPasswordState,
     session_id: i64,
 ) -> Result<String, String> {
+    get_encrypted_secret_internal(store, state, SETTINGS_PWD_PREFIX, session_id)
+}
+
+pub fn get_encrypted_key_passphrase(
+    store: &crate::session_store::SessionStore,
+    state: &MasterPasswordState,
+    session_id: i64,
+) -> Result<String, String> {
+    get_encrypted_secret_internal(store, state, SETTINGS_KEY_PASSPHRASE_PREFIX, session_id)
+}
+
+fn get_encrypted_secret_internal(
+    store: &crate::session_store::SessionStore,
+    state: &MasterPasswordState,
+    prefix: &str,
+    session_id: i64,
+) -> Result<String, String> {
     let key = state.get_key()?;
-    let setting_key = format!("{}{}", SETTINGS_PWD_PREFIX, session_id);
+    let setting_key = format!("{}{}", prefix, session_id);
     let stored = store
         .get_setting(&setting_key)?
-        .ok_or_else(|| format!("No stored password for session {}", session_id))?;
+        .ok_or_else(|| format!("No stored secret for session {}", session_id))?;
 
     let blob = base64::engine::general_purpose::STANDARD
         .decode(&stored)
@@ -258,4 +298,11 @@ pub fn delete_encrypted_password(
     session_id: i64,
 ) -> Result<(), String> {
     store.delete_setting(&format!("{}{}", SETTINGS_PWD_PREFIX, session_id))
+}
+
+pub fn delete_encrypted_key_passphrase(
+    store: &crate::session_store::SessionStore,
+    session_id: i64,
+) -> Result<(), String> {
+    store.delete_setting(&format!("{}{}", SETTINGS_KEY_PASSPHRASE_PREFIX, session_id))
 }

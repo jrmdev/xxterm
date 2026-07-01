@@ -11,8 +11,9 @@ import {
   startSinglePortForward as apiStartSinglePortForward,
   stopSinglePortForward as apiStopSinglePortForward,
   getPortForwardStatus as apiGetPortForwardStatus,
+  type KeyPassphraseInput,
 } from "../ipc/commands";
-import { ensureMasterPasswordReady, sessionNeedsPasswordUnlock } from "./sessions";
+import { ensureMasterPasswordReady, prepareKeyPassphrases, sessionNeedsPasswordUnlock } from "./sessions";
 import type { Session } from "./sessions";
 
 export interface PortForward {
@@ -132,8 +133,10 @@ export async function startPortForwards(sessionId: number) {
     const ready = await ensureMasterPasswordReady();
     if (!ready) return;
   }
+  const keyPassphrases = await prepareKeyPassphrases(sessionId);
+  if (keyPassphrases === null) return;
   try {
-    await apiStartPortForwards(sessionId);
+    await apiStartPortForwards(sessionId, keyPassphrases);
     if (portForwards.sessionId === sessionId) {
       await loadPortForwards(sessionId);
     }
@@ -154,13 +157,15 @@ export async function stopPortForwards(sessionId: number) {
   }
 }
 
-export async function autoStartPortForwards(sessionId: number, terminalId: string) {
+export async function autoStartPortForwards(sessionId: number, terminalId: string, preparedKeyPassphrases?: KeyPassphraseInput[]) {
   if (await sessionNeedsPasswordUnlock(sessionId)) {
     const ready = await ensureMasterPasswordReady();
     if (!ready) return;
   }
+  const keyPassphrases = preparedKeyPassphrases ?? await prepareKeyPassphrases(sessionId);
+  if (keyPassphrases === null) return;
   try {
-    await apiAutoStartPortForwards(sessionId, terminalId);
+    await apiAutoStartPortForwards(sessionId, terminalId, keyPassphrases);
     if (portForwards.sessionId === sessionId) {
       await loadPortForwards(sessionId);
     }
@@ -196,8 +201,10 @@ export async function startSinglePortForward(sessionId: number, forwardId: numbe
     const ready = await ensureMasterPasswordReady();
     if (!ready) return;
   }
+  const keyPassphrases = await prepareKeyPassphrases(sessionId);
+  if (keyPassphrases === null) return;
   try {
-    await apiStartSinglePortForward(sessionId, forwardId);
+    await apiStartSinglePortForward(sessionId, forwardId, keyPassphrases);
     if (portForwards.sessionId === sessionId) {
       await loadPortForwards(sessionId);
     }

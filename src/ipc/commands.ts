@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalProfile } from "../stores/terminalProfiles";
 
+export interface KeyPassphraseInput {
+  sessionId: number;
+  passphrase: string;
+}
+
+export interface PrivateKeyPassphraseStatus {
+  requiresPassphrase: boolean;
+  passphraseValid: boolean;
+  error: string | null;
+}
+
 export async function createPty(id: string, cols: number, rows: number, profile?: TerminalProfile): Promise<void> {
   await invoke("create_pty", {
     id,
@@ -92,6 +103,31 @@ export async function deleteEncryptedPassword(sessionId: number): Promise<void> 
   await invoke("delete_encrypted_password", { sessionId });
 }
 
+export async function inspectPrivateKeyPassphrase(sessionId: number, passphrase?: string): Promise<PrivateKeyPassphraseStatus> {
+  return await invoke("inspect_private_key_passphrase", {
+    input: {
+      sessionId,
+      passphrase: passphrase ?? null,
+    },
+  });
+}
+
+export async function storeEncryptedKeyPassphrase(sessionId: number, passphrase: string): Promise<void> {
+  await invoke("store_encrypted_key_passphrase", { sessionId, passphrase });
+}
+
+export async function getEncryptedKeyPassphrase(sessionId: number): Promise<string | null> {
+  return await invoke("get_encrypted_key_passphrase", { sessionId });
+}
+
+export async function hasEncryptedKeyPassphrase(sessionId: number): Promise<boolean> {
+  return await invoke("has_encrypted_key_passphrase", { sessionId });
+}
+
+export async function deleteEncryptedKeyPassphrase(sessionId: number): Promise<void> {
+  await invoke("delete_encrypted_key_passphrase", { sessionId });
+}
+
 export async function getSetting(key: string): Promise<string | null> {
   return await invoke("get_setting", { key });
 }
@@ -120,8 +156,8 @@ export async function showOpenWithDialog(path: string): Promise<void> {
   await invoke("show_open_with_dialog", { path });
 }
 
-export async function connectSsh(id: string, sessionId: number, cols: number, rows: number): Promise<void> {
-  await invoke("connect_ssh", { id, sessionId, cols, rows });
+export async function connectSsh(id: string, sessionId: number, cols: number, rows: number, keyPassphrases?: KeyPassphraseInput[]): Promise<void> {
+  await invoke("connect_ssh", { id, sessionId, cols, rows, keyPassphrases: keyPassphrases ?? null });
 }
 
 export async function disconnectSsh(id: string): Promise<void> {
@@ -164,16 +200,16 @@ export async function deleteGroup(id: number): Promise<void> {
   await invoke("delete_group", { id });
 }
 
-export async function startPortForwards(sessionId: number): Promise<void> {
-  await invoke("start_port_forwards", { sessionId });
+export async function startPortForwards(sessionId: number, keyPassphrases?: KeyPassphraseInput[]): Promise<void> {
+  await invoke("start_port_forwards", { sessionId, keyPassphrases: keyPassphrases ?? null });
 }
 
 export async function stopPortForwards(sessionId: number): Promise<void> {
   await invoke("stop_port_forwards", { sessionId });
 }
 
-export async function autoStartPortForwards(sessionId: number, terminalId: string): Promise<void> {
-  await invoke("auto_start_port_forwards", { sessionId, terminalId });
+export async function autoStartPortForwards(sessionId: number, terminalId: string, keyPassphrases?: KeyPassphraseInput[]): Promise<void> {
+  await invoke("auto_start_port_forwards", { sessionId, terminalId, keyPassphrases: keyPassphrases ?? null });
 }
 
 export async function autoStopPortForwards(sessionId: number, terminalId: string): Promise<void> {
@@ -184,8 +220,8 @@ export async function getPortForwardStatus(sessionId: number): Promise<any[]> {
   return await invoke("get_port_forward_status", { sessionId });
 }
 
-export async function startSinglePortForward(sessionId: number, forwardId: number): Promise<void> {
-  await invoke("start_single_port_forward", { sessionId, forwardId });
+export async function startSinglePortForward(sessionId: number, forwardId: number, keyPassphrases?: KeyPassphraseInput[]): Promise<void> {
+  await invoke("start_single_port_forward", { sessionId, forwardId, keyPassphrases: keyPassphrases ?? null });
 }
 
 export async function stopSinglePortForward(sessionId: number, forwardId: number): Promise<void> {

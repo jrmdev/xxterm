@@ -6,7 +6,7 @@ use crate::session_store::{
 };
 use crate::ssh_config;
 use font_kit::source::SystemSource;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 #[cfg(target_os = "windows")]
 use std::process::Command;
@@ -22,6 +22,21 @@ pub struct AppBootstrapState {
     pub scrollback: Option<String>,
     pub has_master_password: bool,
     pub unlocked: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateKeyPassphraseStatus {
+    pub requires_passphrase: bool,
+    pub passphrase_valid: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateKeyInspectInput {
+    pub session_id: i64,
+    pub passphrase: Option<String>,
 }
 
 #[tauri::command]
@@ -148,6 +163,89 @@ pub fn delete_encrypted_password(
     session_id: i64,
 ) -> Result<(), String> {
     crypto::delete_encrypted_password(&store, session_id)
+}
+
+#[tauri::command]
+pub fn inspect_private_key_passphrase(
+    store: tauri::State<'_, SessionStore>,
+    input: PrivateKeyInspectInput,
+) -> Result<PrivateKeyPassphraseStatus, String> {
+    let session = store.get_session(input.session_id)?;
+    let path = session.private_key_path.ok_or_else(|| {
+        format!(
+            "No private key path configured for session {}",
+            session.name
+        )
+    })?;
+
+    match russh::keys::load_secret_key(&path, input.passphrase.as_deref()) {
+        Ok(_) => Ok(PrivateKeyPassphraseStatus {
+            requires_passphrase: false,
+            passphrase_valid: true,
+            error: None,
+        }),
+        Err(russh::keys::Error::KeyIsEncrypted) => Ok(PrivateKeyPassphraseStatus {
+            requires_passphrase: true,
+            passphrase_valid: false,
+            error: None,
+        }),
+        Err(err) if input.passphrase.is_some() => Ok(PrivateKeyPassphraseStatus {
+            requires_passphrase: true,
+            passphrase_valid: false,
+            error: Some(err.to_string()),
+        }),
+        Err(err) => Err(format!(
+            "Failed to load private key for session {}: {}",
+            session.name, err
+        )),
+    }
+}
+
+#[tauri::command]
+pub fn store_encrypted_key_passphrase(
+    store: tauri::State<'_, SessionStore>,
+    state: tauri::State<'_, MasterPasswordState>,
+    session_id: i64,
+    passphrase: String,
+) -> Result<(), String> {
+    crypto::encrypt_and_store_key_passphrase(&store, &state, session_id, &passphrase)
+}
+
+#[tauri::command]
+pub fn get_encrypted_key_passphrase(
+    store: tauri::State<'_, SessionStore>,
+    state: tauri::State<'_, MasterPasswordState>,
+    session_id: i64,
+) -> Result<Option<String>, String> {
+    if !state.is_unlocked() {
+        return Ok(None);
+    }
+    match crypto::get_encrypted_key_passphrase(&store, &state, session_id) {
+        Ok(passphrase) => Ok(Some(passphrase)),
+        Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+pub fn has_encrypted_key_passphrase(
+    store: tauri::State<'_, SessionStore>,
+    session_id: i64,
+) -> Result<bool, String> {
+    store
+        .get_setting(&format!(
+            "{}{}",
+            crypto::SETTINGS_KEY_PASSPHRASE_PREFIX,
+            session_id
+        ))
+        .map(|value| value.is_some())
+}
+
+#[tauri::command]
+pub fn delete_encrypted_key_passphrase(
+    store: tauri::State<'_, SessionStore>,
+    session_id: i64,
+) -> Result<(), String> {
+    crypto::delete_encrypted_key_passphrase(&store, session_id)
 }
 
 #[tauri::command]

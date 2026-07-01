@@ -89,8 +89,8 @@ export default function MasterPasswordPrompt() {
         </div>
         <p class="form-help" style={{ "margin-bottom": "16px" }}>
           {needsSetup
-            ? "A master password is required to securely store session passwords. Please set one now."
-            : "Your master password is needed to access stored session passwords."}
+            ? "A master password is required to securely store session passwords and private key passphrases."
+            : "Your master password is needed to access stored session passwords and private key passphrases."}
         </p>
 
         <form onSubmit={handleSubmit}>

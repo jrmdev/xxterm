@@ -7,11 +7,17 @@ import {
   getSession as apiGetSession,
   storeEncryptedPassword,
   deleteEncryptedPassword,
+  inspectPrivateKeyPassphrase,
+  storeEncryptedKeyPassphrase,
+  getEncryptedKeyPassphrase,
+  hasEncryptedKeyPassphrase,
+  deleteEncryptedKeyPassphrase,
   importSshConfig as apiImportSshConfig,
   listSshConfigEntries as apiListSshConfigEntries,
   listGroups as apiListGroups,
   createGroup as apiCreateGroup,
   deleteGroup as apiDeleteGroup,
+  type KeyPassphraseInput,
 } from "../ipc/commands";
 import { settings, refreshMasterPasswordStatus, unlockWithMasterPassword, setupMasterPassword } from "./settings";
 import { addTerminal } from "./terminals";
@@ -73,6 +79,18 @@ export interface SshConfigEntry {
 }
 
 type PendingResolver = (value: boolean) => void;
+type PendingPassphraseResolver = (value: KeyPassphrasePromptResult | null) => void;
+
+interface KeyPassphrasePromptState {
+  sessionId: number;
+  sessionName: string;
+  privateKeyPath: string;
+}
+
+export interface KeyPassphrasePromptResult {
+  passphrase: string;
+  save: boolean;
+}
 
 export const [sessions, setSessions] = createStore<{
   list: Session[];
@@ -83,6 +101,8 @@ export const [sessions, setSessions] = createStore<{
   masterPasswordMode: "set" | "unlock" | null;
   pendingResolver: PendingResolver | null;
   pendingConnect: { name: string; sessionId: number } | null;
+  keyPassphrasePrompt: KeyPassphrasePromptState | null;
+  keyPassphraseResolver: PendingPassphraseResolver | null;
 }>({
   list: [],
   groups: [],
@@ -92,6 +112,8 @@ export const [sessions, setSessions] = createStore<{
   masterPasswordMode: null,
   pendingResolver: null,
   pendingConnect: null,
+  keyPassphrasePrompt: null,
+  keyPassphraseResolver: null,
 });
 
 export async function loadSessions() {
@@ -148,6 +170,13 @@ export function closeMasterPasswordPrompt() {
   if (resolver) resolver(false);
 }
 
+export function closeKeyPassphrasePrompt() {
+  const resolver = sessions.keyPassphraseResolver;
+  setSessions("keyPassphrasePrompt", null);
+  setSessions("keyPassphraseResolver", null);
+  if (resolver) resolver(null);
+}
+
 export async function handleMasterPasswordSubmit(masterPwd: string) {
   try {
     if (sessions.masterPasswordMode === "set") {
@@ -167,7 +196,7 @@ export async function handleMasterPasswordSubmit(masterPwd: string) {
       const pending = sessions.pendingConnect;
       setSessions("pendingConnect", null);
       if (pending) {
-        addTerminal(pending.name, "ssh", pending.sessionId);
+        void connectWithMasterPassword(pending.name, pending.sessionId);
       }
     }
   } catch (e: any) {
@@ -197,7 +226,8 @@ export async function ensureMasterPasswordReady(): Promise<boolean> {
   return true;
 }
 
-export async function sessionNeedsPasswordUnlock(sessionId: number): Promise<boolean> {
+async function getConnectionChain(sessionId: number): Promise<Session[]> {
+  const chain: Session[] = [];
   const seen = new Set<number>();
   let currentId: number | null = sessionId;
 
@@ -208,38 +238,118 @@ export async function sessionNeedsPasswordUnlock(sessionId: number): Promise<boo
     seen.add(currentId);
 
     const session: Session = sessions.list.find((item) => item.id === currentId) ?? await apiGetSession(currentId);
+    chain.unshift(session);
+    currentId = session.jump_host_session_id;
+  }
+
+  return chain;
+}
+
+function promptForKeyPassphrase(session: Session): Promise<KeyPassphrasePromptResult | null> {
+  return new Promise((resolve) => {
+    setSessions("keyPassphrasePrompt", {
+      sessionId: session.id,
+      sessionName: session.name,
+      privateKeyPath: session.private_key_path ?? "",
+    });
+    setSessions("keyPassphraseResolver", () => resolve as PendingPassphraseResolver);
+  });
+}
+
+export async function handleKeyPassphraseSubmit(passphrase: string, save: boolean) {
+  const prompt = sessions.keyPassphrasePrompt;
+  if (!prompt) return;
+
+  const status = await inspectPrivateKeyPassphrase(prompt.sessionId, passphrase);
+  if (!status.passphraseValid) {
+    throw new Error(status.error || "Incorrect private key passphrase");
+  }
+
+  if (save) {
+    const ready = await ensureMasterPasswordReady();
+    if (!ready) {
+      throw new Error("Master password is required to save this passphrase");
+    }
+    await storeEncryptedKeyPassphrase(prompt.sessionId, passphrase);
+  }
+
+  const resolver = sessions.keyPassphraseResolver;
+  setSessions("keyPassphrasePrompt", null);
+  setSessions("keyPassphraseResolver", null);
+  if (resolver) resolver({ passphrase, save });
+}
+
+export async function prepareKeyPassphrases(sessionId: number): Promise<KeyPassphraseInput[] | null> {
+  const chain = await getConnectionChain(sessionId);
+  const keyPassphrases: KeyPassphraseInput[] = [];
+
+  for (const session of chain) {
+    if (session.auth_method !== "key" || !session.private_key_path) continue;
+
+    let initialStatus;
+    try {
+      initialStatus = await inspectPrivateKeyPassphrase(session.id);
+    } catch {
+      continue;
+    }
+    if (!initialStatus.requiresPassphrase) continue;
+
+    if (await hasEncryptedKeyPassphrase(session.id)) {
+      const ready = await ensureMasterPasswordReady();
+      if (!ready) return null;
+
+      const savedPassphrase = await getEncryptedKeyPassphrase(session.id);
+      if (savedPassphrase) {
+        const savedStatus = await inspectPrivateKeyPassphrase(session.id, savedPassphrase);
+        if (savedStatus.passphraseValid) {
+          keyPassphrases.push({ sessionId: session.id, passphrase: savedPassphrase });
+          continue;
+        }
+        await deleteEncryptedKeyPassphrase(session.id);
+      }
+    }
+
+    const response = await promptForKeyPassphrase(session);
+    if (!response) return null;
+    keyPassphrases.push({ sessionId: session.id, passphrase: response.passphrase });
+  }
+
+  return keyPassphrases;
+}
+
+export async function sessionNeedsPasswordUnlock(sessionId: number): Promise<boolean> {
+  for (const session of await getConnectionChain(sessionId)) {
     if (session.auth_method === "password") {
       return true;
     }
-    currentId = session.jump_host_session_id;
   }
 
   return false;
 }
 
 export async function connectWithMasterPassword(name: string, sessionId: number) {
-  if (!await sessionNeedsPasswordUnlock(sessionId)) {
-    addTerminal(name, "ssh", sessionId);
-    return;
+  if (await sessionNeedsPasswordUnlock(sessionId)) {
+    await refreshMasterPasswordStatus();
+
+    if (!settings.hasMasterPassword) {
+      setSessions("pendingConnect", { name, sessionId });
+      setSessions("masterPasswordPrompt", true);
+      setSessions("masterPasswordMode", "set");
+      return;
+    }
+
+    if (!settings.unlocked) {
+      setSessions("pendingConnect", { name, sessionId });
+      setSessions("masterPasswordPrompt", true);
+      setSessions("masterPasswordMode", "unlock");
+      return;
+    }
   }
 
-  await refreshMasterPasswordStatus();
+  const keyPassphrases = await prepareKeyPassphrases(sessionId);
+  if (keyPassphrases === null) return;
 
-  if (!settings.hasMasterPassword) {
-    setSessions("pendingConnect", { name, sessionId });
-    setSessions("masterPasswordPrompt", true);
-    setSessions("masterPasswordMode", "set");
-    return;
-  }
-
-  if (!settings.unlocked) {
-    setSessions("pendingConnect", { name, sessionId });
-    setSessions("masterPasswordPrompt", true);
-    setSessions("masterPasswordMode", "unlock");
-    return;
-  }
-
-  addTerminal(name, "ssh", sessionId);
+  addTerminal(name, "ssh", sessionId, undefined, keyPassphrases);
 }
 
 export async function saveSession(input: CreateSessionInput, password?: string) {
@@ -285,6 +395,7 @@ export async function editSession(id: number, input: UpdateSessionInput, passwor
 export async function removeSession(id: number) {
   await apiDeleteSession(id);
   await deleteEncryptedPassword(id);
+  await deleteEncryptedKeyPassphrase(id);
   await loadSessions();
 }
 
