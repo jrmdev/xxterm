@@ -55,7 +55,7 @@ pub enum FwdCommand {
         remote_host: String,
         remote_port: u16,
         forward_id: i64,
-        stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        stop_rx: tokio::sync::watch::Receiver<bool>,
         app: tauri::AppHandle,
     },
     StartRemote {
@@ -65,7 +65,7 @@ pub enum FwdCommand {
         remote_host: String,
         remote_port: u16,
         forward_id: i64,
-        stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        stop_rx: tokio::sync::watch::Receiver<bool>,
         app: tauri::AppHandle,
     },
     StartDynamic {
@@ -73,7 +73,7 @@ pub enum FwdCommand {
         local_host: String,
         local_port: u16,
         forward_id: i64,
-        stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        stop_rx: tokio::sync::watch::Receiver<bool>,
         app: tauri::AppHandle,
     },
 }
@@ -346,10 +346,6 @@ fn spawn_forward_command(cmd: FwdCommand, shared_handle: SharedSshHandle) {
             app,
         } => {
             let h = shared_handle.clone();
-            let stop_rx = stop_rx.unwrap_or_else(|| {
-                let (_, rx) = tokio::sync::watch::channel(false);
-                rx
-            });
             tokio::spawn(async move {
                 crate::port_forward::run_local_forward(
                     h,
@@ -376,10 +372,6 @@ fn spawn_forward_command(cmd: FwdCommand, shared_handle: SharedSshHandle) {
             app,
         } => {
             let h = shared_handle.clone();
-            let stop_rx = stop_rx.unwrap_or_else(|| {
-                let (_, rx) = tokio::sync::watch::channel(false);
-                rx
-            });
             tokio::spawn(async move {
                 crate::port_forward::run_remote_forward(
                     h,
@@ -404,10 +396,6 @@ fn spawn_forward_command(cmd: FwdCommand, shared_handle: SharedSshHandle) {
             app,
         } => {
             let h = shared_handle.clone();
-            let stop_rx = stop_rx.unwrap_or_else(|| {
-                let (_, rx) = tokio::sync::watch::channel(false);
-                rx
-            });
             tokio::spawn(async move {
                 crate::port_forward::run_dynamic_forward(
                     h, session_id, local_host, local_port, forward_id, stop_rx, app,
@@ -508,6 +496,10 @@ async fn connect_authenticated_session(
 ) -> Result<SharedSshHandle, ()> {
     let config = Arc::new(client::Config {
         nodelay: true,
+        // Detect dead peers/networks: probe after 15s of silence, give up after
+        // 3 unanswered probes so channels close and cleanup runs (~45-60s).
+        keepalive_interval: Some(std::time::Duration::from_secs(15)),
+        keepalive_max: 3,
         ..client::Config::default()
     });
     let handler = SshHandler {
@@ -740,12 +732,22 @@ fn spawn_ssh_task(
             }
 
             if register_port_forward_transport {
+                // The headless transport has no PTY channel whose closure would
+                // signal a dead connection, so poll the transport handle directly.
+                let mut liveness = tokio::time::interval(std::time::Duration::from_secs(15));
+                liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         Some(_) = rx.recv() => {}
                         Some(_) = resize_rx.recv() => {}
                         Some(cmd) = fwd_rx.recv() => {
                             spawn_forward_command(cmd, shared_handle.clone());
+                        }
+                        _ = liveness.tick() => {
+                            if shared_handle.lock().await.is_closed() {
+                                log::info!("ssh {}: transport closed, stopping port forward transport", sid);
+                                break;
+                            }
                         }
                         _ = &mut abort_rx => {
                             log::info!("ssh {}: abort signal received", sid);
@@ -829,26 +831,28 @@ fn spawn_ssh_task(
 
             loop {
                 tokio::select! {
-                    Some(msg) = channel.wait() => {
+                    msg = channel.wait() => {
                         match msg {
-                            ChannelMsg::Data { ref data } => {
+                            Some(ChannelMsg::Data { ref data }) => {
                                 if !data.is_empty() {
                                     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
                                     let _ = handle.emit(&format!("pty-output-{}", sid), &encoded);
                                 }
                             }
-                            ChannelMsg::Eof | ChannelMsg::Close => {
+                            // None means the transport died (e.g. keepalive timeout);
+                            // treat it like a closed channel instead of stalling the loop.
+                            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                                 log::info!("ssh {}: channel closed", sid);
                                 break;
                             }
-                            ChannelMsg::ExitStatus { exit_status } => {
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
                                 exit_event = TerminalExitEvent::unexpected(format!(
                                     "[Process exited with code {}]",
                                     exit_status
                                 ));
                                 break;
                             }
-                            _ => {}
+                            Some(_) => {}
                         }
                     }
                     Some(data) = rx.recv() => {

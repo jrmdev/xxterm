@@ -3,10 +3,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Mutex;
 
 use russh::client;
-use russh::ChannelMsg;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
@@ -517,7 +516,7 @@ fn queue_forward_start(
                 remote_host,
                 remote_port,
                 forward_id: fwd.id,
-                stop_rx: Some(stop_rx),
+                stop_rx,
                 app: app.clone(),
             }
         }
@@ -531,7 +530,7 @@ fn queue_forward_start(
                 remote_host,
                 remote_port,
                 forward_id: fwd.id,
-                stop_rx: Some(stop_rx),
+                stop_rx,
                 app: app.clone(),
             }
         }
@@ -540,7 +539,7 @@ fn queue_forward_start(
             local_host: fwd.local_host.clone(),
             local_port: fwd.local_port,
             forward_id: fwd.id,
-            stop_rx: Some(stop_rx),
+            stop_rx,
             app: app.clone(),
         },
         _ => return,
@@ -619,48 +618,13 @@ fn bind_tcp_listener(addr: &str) -> Result<TcpListener, std::io::Error> {
 }
 
 pub(crate) async fn bridge_tcp_channel(
-    stream: tokio::net::TcpStream,
-    mut channel: russh::Channel<client::Msg>,
+    mut stream: tokio::net::TcpStream,
+    channel: russh::Channel<client::Msg>,
 ) {
-    let (mut tcp_read, mut tcp_write) = stream.into_split();
-    let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-    let reader = tokio::spawn(async move {
-        let mut buf = vec![0u8; 32 * 1024];
-        loop {
-            let n = match tcp_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if data_tx.send(buf[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
-
-    loop {
-        tokio::select! {
-            Some(data) = data_rx.recv() => {
-                if channel.data(&data[..]).await.is_err() {
-                    break;
-                }
-            }
-            msg = channel.wait() => {
-                match msg {
-                    Some(ChannelMsg::Data { data }) => {
-                        if tcp_write.write_all(&data).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                    _ => {}
-                }
-            }
-            else => break,
-        }
+    let mut channel_stream = channel.into_stream();
+    if let Err(e) = copy_bidirectional(&mut stream, &mut channel_stream).await {
+        log::warn!("port forward bridge closed with error: {}", e);
     }
-
-    reader.abort();
 }
 
 async fn handle_socks5(
@@ -844,8 +808,10 @@ pub async fn run_local_forward(
                     }
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            changed = stop_rx.changed() => {
+                // Err means the cancel sender was dropped; treat it as a stop
+                // signal rather than re-polling a closed channel forever.
+                if changed.is_err() || *stop_rx.borrow() {
                     log::info!("fwd {}: local forward stopped", forward_id);
                     break;
                 }
@@ -915,11 +881,11 @@ pub async fn run_remote_forward(
         dest
     );
 
-    // Wait for stop signal
-    stop_rx.changed().await.ok();
-    if !*stop_rx.borrow() {
-        // Also wait for actual stop
-        let _ = stop_rx.changed().await;
+    // Wait until a stop is signalled or the cancel sender is dropped
+    while stop_rx.changed().await.is_ok() {
+        if *stop_rx.borrow() {
+            break;
+        }
     }
 
     log::info!("fwd {}: remote forward stopped", forward_id);
@@ -980,8 +946,8 @@ pub async fn run_dynamic_forward(
                     }
                 }
             }
-            _ = stop_rx.changed() => {
-                if *stop_rx.borrow() {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
                     log::info!("fwd {}: dynamic forward stopped", forward_id);
                     break;
                 }

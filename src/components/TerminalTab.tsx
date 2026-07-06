@@ -109,6 +109,9 @@ export default function TerminalTab(props: Props) {
   const focusTerminal = () => {
     requestAnimationFrame(() => {
       fitTerminal();
+      if (term) {
+        term.refresh(0, Math.max(0, term.rows - 1));
+      }
       term?.focus();
     });
   };
@@ -128,6 +131,9 @@ export default function TerminalTab(props: Props) {
     term?.write(`\r\n\x1b[31m${event?.message || "[Process exited]"}\x1b[0m\r\n`);
     term?.write("\r\n\x1b[31m      - Press \"r\" to restart\x1b[0m");
     term?.write("\r\n\x1b[31m      - Press \"q\" to close\x1b[0m\r\n");
+    if (term && props.active) {
+      term.refresh(0, Math.max(0, term.rows - 1));
+    }
     if (!props.active) {
       setTerminalUnseenActivity(props.id, true);
     }
@@ -460,62 +466,49 @@ export default function TerminalTab(props: Props) {
       }
     });
 
-    async function restart() {
-      unlistenExit?.();
-      await closePty(props.id);
-      term?.write("\r\n\x1b[32mRestarting...\x1b[0m\r\n");
-      exited = false;
-      unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, (event) => {
-        if (event.payload?.initiatedByUser) return;
-        handleUnexpectedExit(event.payload);
-      });
+    const handleExitEvent = (event: { payload?: TerminalExitEvent }) => {
+      if (event.payload?.initiatedByUser) return;
+      handleUnexpectedExit(event.payload);
+    };
+
+    async function startSession(failureMessage: string): Promise<boolean> {
       try {
+        const { cols, rows } = getTerminalSize();
         if (props.type === "ssh" && props.sessionId) {
-          const { cols: c, rows: r } = getTerminalSize();
           setTerminalConnectionState(props.id, "connecting");
           setSidebarPane("sftp");
-          await connectSsh(props.id, props.sessionId, c, r, props.keyPassphrases);
+          await connectSsh(props.id, props.sessionId, cols, rows, props.keyPassphrases);
           setTerminalConnectionState(props.id, "connected");
           void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
         } else {
-          const { cols, rows } = getTerminalSize();
           await createPty(props.id, cols, rows, props.profile);
         }
-        setTerminalExited(props.id, false);
-        term?.write("\x1b[2J\x1b[H");
+        return true;
       } catch (e) {
         if (props.type === "ssh") {
           setTerminalConnectionState(props.id, "disconnected");
           syncSidebarWithActiveTerminal(true);
         }
-        term?.write(`\r\n\x1b[31mFailed to restart: ${e}\x1b[0m`);
+        term?.write(`\r\n\x1b[31m${failureMessage}: ${e}\x1b[0m`);
+        return false;
       }
     }
 
-    unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, (event) => {
-      if (event.payload?.initiatedByUser) return;
-      handleUnexpectedExit(event.payload);
-    });
-
-    try {
-      if (props.type === "ssh" && props.sessionId) {
-        const { cols: c, rows: r } = getTerminalSize();
-        setTerminalConnectionState(props.id, "connecting");
-        setSidebarPane("sftp");
-        await connectSsh(props.id, props.sessionId, c, r, props.keyPassphrases);
-        setTerminalConnectionState(props.id, "connected");
-        void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
-      } else {
-        const { cols, rows } = getTerminalSize();
-        await createPty(props.id, cols, rows, props.profile);
+    async function restart() {
+      unlistenExit?.();
+      await closePty(props.id);
+      term?.write("\r\n\x1b[32mRestarting...\x1b[0m\r\n");
+      exited = false;
+      unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, handleExitEvent);
+      if (await startSession("Failed to restart")) {
+        setTerminalExited(props.id, false);
+        term?.write("\x1b[2J\x1b[H");
       }
-    } catch (e) {
-      if (props.type === "ssh") {
-        setTerminalConnectionState(props.id, "disconnected");
-        syncSidebarWithActiveTerminal(true);
-      }
-      term.write(`\r\n\x1b[31mFailed to start terminal: ${e}\x1b[0m`);
     }
+
+    unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, handleExitEvent);
+
+    await startSession("Failed to start terminal");
 
     resizeObserver = new ResizeObserver(fitTerminal);
     resizeObserver.observe(terminalRef);

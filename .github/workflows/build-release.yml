@@ -22,16 +22,19 @@ jobs:
         platform:
           - name: linux
             runner: ubuntu-latest
+            os: linux
+            arch: x64
             binary: xxterm
-            archive: xxterm-linux.zip
           - name: macos
             runner: macos-latest
+            os: macos
+            arch: x64
             binary: xxterm
-            archive: xxterm-macos.zip
           - name: windows
             runner: windows-latest
+            os: windows
+            arch: x64
             binary: xxterm.exe
-            archive: xxterm-windows.zip
 
     steps:
       - name: Checkout
@@ -95,24 +98,24 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           cd release
-          zip "../${{ matrix.platform.archive }}" "${{ matrix.platform.binary }}"
+          zip "../xxterm_${{ github.ref_name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.zip" "${{ matrix.platform.binary }}"
 
       - name: Zip macOS release
         if: runner.os == 'macOS'
         run: |
           cd release
-          zip "../${{ matrix.platform.archive }}" "${{ matrix.platform.binary }}"
+          zip "../xxterm_${{ github.ref_name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.zip" "${{ matrix.platform.binary }}"
 
       - name: Zip Windows release
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "release/${{ matrix.platform.binary }}" -DestinationPath "${{ matrix.platform.archive }}" -Force
+        run: Compress-Archive -Path "release/${{ matrix.platform.binary }}" -DestinationPath "xxterm_${{ github.ref_name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.zip" -Force
 
       - name: Upload zipped artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.platform.archive }}
-          path: ${{ matrix.platform.archive }}
+          name: xxterm_${{ github.ref_name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.zip
+          path: xxterm_${{ github.ref_name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}.zip
           if-no-files-found: error
 
   publish:

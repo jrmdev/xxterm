@@ -1,6 +1,6 @@
 import { createEffect, createSignal, For, lazy, onCleanup, onMount, Show, Suspense } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
-import { terminals, addTerminal, removeTerminal, renameTerminal, reorderTerminals, setActiveTerminal, setTerminalUnseenActivity, setTerminalExited } from "../stores/terminals";
+import { terminals, addTerminal, removeTerminal, renameTerminal, reorderTerminals, setActiveTerminal, setTerminalUnseenActivity } from "../stores/terminals";
 import type { Terminal } from "../stores/terminals";
 import {
   addTerminalProfile,
@@ -72,7 +72,6 @@ export default function TerminalPane() {
   const activateTab = (tab: Terminal) => {
     setActiveTerminal(tab.id);
     setTerminalUnseenActivity(tab.id, false);
-    setTerminalExited(tab.id, false);
     if (tab.type === "ssh" && tab.sessionId) {
       setSidebarPane("sftp");
     } else {

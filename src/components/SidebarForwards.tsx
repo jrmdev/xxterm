@@ -128,6 +128,8 @@ export default function SidebarForwards() {
             const active = () => forward.status === "active";
             const pending = () => forward.status === "pending" || forward.status === "starting";
             const loading = () => loadingIds().has(forward.id);
+            const startDisabled = () => active() || pending() || loading();
+            const stopDisabled = () => !active() || loading();
             return (
               <div style={listingRowStyle}>
                 <span style={{ ...listingIconStyle, color: active() ? "var(--app-success)" : "var(--app-muted)" }}>
@@ -151,10 +153,11 @@ export default function SidebarForwards() {
                   <button
                     style={{
                       ...actionButtonStyle,
-                      color: active() || pending() || loading() ? "var(--app-muted)" : "var(--app-success)",
-                      opacity: active() || pending() || loading() ? "0.55" : "1",
+                      color: startDisabled() ? "var(--app-muted)" : "var(--app-success)",
+                      opacity: startDisabled() ? "0.55" : "1",
+                      cursor: startDisabled() ? "not-allowed" : "pointer",
                     }}
-                    disabled={active() || pending() || loading()}
+                    disabled={startDisabled()}
                     onClick={() => void handleStart(forward)}
                     title="Start"
                     aria-label="Start"
@@ -164,12 +167,13 @@ export default function SidebarForwards() {
                   <button
                     style={{
                       ...actionButtonStyle,
-                      color: (!active() && !pending()) || loading() ? "var(--app-muted)" : "var(--app-danger)",
-                      opacity: (!active() && !pending()) || loading() ? "0.55" : "1",
+                      color: stopDisabled() ? "var(--app-muted)" : "var(--app-danger)",
+                      opacity: stopDisabled() ? "0.55" : "1",
+                      cursor: stopDisabled() ? "not-allowed" : "pointer",
                     }}
-                    disabled={(!active() && !pending()) || loading()}
+                    disabled={stopDisabled()}
                     onClick={() => void handleStop(forward)}
-                    title="Stop"
+                    title={pending() ? "Waiting for connection" : "Stop"}
                     aria-label="Stop"
                   >
                     {"\u25A0"}

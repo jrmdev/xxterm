@@ -135,6 +135,9 @@ function orderedSelection(paths: string[], selected: Set<string>) {
 export default function FileBrowser() {
   let retryTimer: number | undefined;
   let errorOverlayTimer: number | undefined;
+  let typeaheadResetTimer: number | undefined;
+  let listingRef: HTMLDivElement | undefined;
+  const entryRefs = new Map<string, HTMLDivElement>();
   const [busyPath, setBusyPath] = createSignal<string | null>(null);
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; entry: RemoteFileEntry | null } | null>(null);
   const [visibleError, setVisibleError] = createSignal("");
@@ -142,6 +145,7 @@ export default function FileBrowser() {
   let renameInputRef: HTMLInputElement | undefined;
   const [newFolderDialog, setNewFolderDialog] = createSignal<string | null>(null);
   let newFolderInputRef: HTMLInputElement | undefined;
+  const [typeaheadQuery, setTypeaheadQuery] = createSignal("");
   const terminalId = createMemo(() => getActiveSshTerminalId());
   const activeView = createMemo(() => getActiveSftpView());
   const visibleEntries = createMemo(() => {
@@ -193,6 +197,12 @@ export default function FileBrowser() {
   });
 
   createEffect(() => {
+    activeView().currentPath;
+    visibleEntries().length;
+    resetTypeahead();
+  });
+
+  createEffect(() => {
     const error = activeView().error;
     if (errorOverlayTimer !== undefined) {
       window.clearTimeout(errorOverlayTimer);
@@ -241,6 +251,9 @@ export default function FileBrowser() {
     if (errorOverlayTimer !== undefined) {
       window.clearTimeout(errorOverlayTimer);
     }
+    if (typeaheadResetTimer !== undefined) {
+      window.clearTimeout(typeaheadResetTimer);
+    }
   });
 
   const refresh = async () => {
@@ -268,9 +281,67 @@ export default function FileBrowser() {
     await loadRemoteDirectory(activeTerminalId);
   };
 
+  const focusListing = () => {
+    listingRef?.focus();
+  };
+
+  const resetTypeahead = () => {
+    if (typeaheadResetTimer !== undefined) {
+      window.clearTimeout(typeaheadResetTimer);
+      typeaheadResetTimer = undefined;
+    }
+    setTypeaheadQuery("");
+  };
+
+  const queueTypeaheadReset = () => {
+    if (typeaheadResetTimer !== undefined) {
+      window.clearTimeout(typeaheadResetTimer);
+    }
+    typeaheadResetTimer = window.setTimeout(() => {
+      typeaheadResetTimer = undefined;
+      setTypeaheadQuery("");
+    }, 3000);
+  };
+
+  const selectEntryByTyping = (typedCharacter: string) => {
+    const entries = visibleEntries();
+    if (entries.length === 0) return;
+
+    const singleCharacterQuery = typedCharacter.toLocaleLowerCase();
+    const nextQuery = `${typeaheadQuery()}${typedCharacter}`.toLocaleLowerCase();
+    const startIndex = Math.max(0, entries.findIndex((entry) => entry.path === activeView().selectedPaths[0]));
+    const rotatedEntries = [...entries.slice(startIndex), ...entries.slice(0, startIndex)];
+    const match = rotatedEntries.find((entry) => entry.name.toLocaleLowerCase().startsWith(nextQuery))
+      ?? entries.find((entry) => entry.name.toLocaleLowerCase().startsWith(nextQuery));
+    const fallbackMatch = rotatedEntries.find((entry) => entry.name.toLocaleLowerCase().startsWith(singleCharacterQuery))
+      ?? entries.find((entry) => entry.name.toLocaleLowerCase().startsWith(singleCharacterQuery));
+
+    const resolvedMatch = match ?? fallbackMatch;
+    if (!resolvedMatch) {
+      resetTypeahead();
+      return;
+    }
+
+    setTypeaheadQuery(match ? nextQuery : singleCharacterQuery);
+    queueTypeaheadReset();
+    setSelectedPaths([resolvedMatch.path], resolvedMatch.path);
+    entryRefs.get(resolvedMatch.path)?.scrollIntoView({ block: "nearest" });
+  };
+
+  const handleListingKeyDown = (event: KeyboardEvent) => {
+    if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
+    if (event.key.length !== 1 || /\p{C}/u.test(event.key)) return;
+    if (contextMenu() || renameDialog() || newFolderDialog() !== null) return;
+
+    event.preventDefault();
+    selectEntryByTyping(event.key);
+  };
+
   const handleEntryMouseDown = (event: MouseEvent, entry: RemoteFileEntry) => {
     if (event.button !== 0) return;
     event.preventDefault();
+    focusListing();
+    resetTypeahead();
 
     const visiblePaths = visibleEntries().map((item) => item.path);
     const currentSelection = new Set(activeView().selectedPaths);
@@ -525,15 +596,23 @@ export default function FileBrowser() {
           </div>
         </Show>
         <div
-          style={{ height: "100%" }}
+          ref={listingRef}
+          tabindex={0}
+          style={{ height: "100%", outline: "none" }}
+          onKeyDown={handleListingKeyDown}
+          onBlur={() => resetTypeahead()}
           onMouseDown={(event) => {
             if (event.button !== 0 || event.target !== event.currentTarget) return;
+            focusListing();
+            resetTypeahead();
             setSelectedPaths([], null);
             setContextMenu(null);
           }}
           onContextMenu={(event) => {
             if (event.target !== event.currentTarget) return;
             event.preventDefault();
+            focusListing();
+            resetTypeahead();
             setSelectedPaths([], null);
             setContextMenu({ x: event.clientX, y: event.clientY, entry: null });
           }}
@@ -541,11 +620,14 @@ export default function FileBrowser() {
         <For each={visibleEntries()}>
           {(entry) => (
             <div
+              ref={(element) => entryRefs.set(entry.path, element)}
               onMouseDown={(event) => handleEntryMouseDown(event, entry)}
               onDblClick={() => void openEntry(entry)}
               onContextMenu={(event) => {
                 event.preventDefault();
                 event.stopPropagation();
+                focusListing();
+                resetTypeahead();
                 if (!selectedPathSet().has(entry.path)) {
                   setSelectedPaths([entry.path], entry.path);
                 }
@@ -933,4 +1015,3 @@ const toolbarButtonStyle = {
   width: "26px",
   height: "26px",
 } as const;
-

@@ -94,7 +94,7 @@ function PortForwardRow(props: Props & { forward: PortForward }) {
           {"\u25B6"}
         </button>
       </Show>
-      <Show when={isStarting() || isLoading()}>
+      <Show when={isStarting() || isPending() || isLoading()}>
         <span
           style={{
             color: "var(--app-warning)",
@@ -102,12 +102,12 @@ function PortForwardRow(props: Props & { forward: PortForward }) {
             display: "inline-block",
             animation: "pf-spin 1s linear infinite",
           }}
-          title={isLoading() ? "Working..." : "Starting..."}
+          title={isLoading() ? "Working..." : isPending() ? "Waiting for connection..." : "Starting..."}
         >
           {"\u25D4"}
         </span>
       </Show>
-      <Show when={!isStarting() && !isLoading() && (isRunning() || isPending())}>
+      <Show when={!isStarting() && !isPending() && !isLoading() && isRunning()}>
         <button
           onClick={() => props.onStopOne(fwd)}
           style={{ ...smallBtnStyle, color: "var(--app-danger)", border: "none" }}

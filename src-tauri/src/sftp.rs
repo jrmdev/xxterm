@@ -2061,7 +2061,10 @@ async fn exec_ssh_command(handle: &SharedSshHandle, command: &str) -> Result<(),
                     stderr_output.push_str(&String::from_utf8_lossy(data));
                 }
             }
-            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+            // exit-status typically arrives after EOF; keep draining until the
+            // channel closes so failed commands are not reported as success.
+            Some(ChannelMsg::Eof) => {}
+            Some(ChannelMsg::Close) | None => break,
             Some(_) => {}
         }
     }
