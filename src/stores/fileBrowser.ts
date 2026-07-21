@@ -110,8 +110,8 @@ function isCurrentDirectoryLoad(terminalId: string, token: number) {
   return directoryLoadTokens.get(terminalId) === token;
 }
 
-function transferRateKey(terminalId: string, transferId: string) {
-  return `${terminalId}:${transferId}`;
+function transferRateKey(terminalId: string, queueId: string, transferId: string) {
+  return `${terminalId}:${queueId}:${transferId}`;
 }
 
 const STALE_RATE_MS = 2500;
@@ -122,7 +122,7 @@ function reconcileTransferRates(now = Date.now()) {
 
   batch(() => {
     for (const transfer of fileBrowser.transfers) {
-      const key = transferRateKey(transfer.terminalId, transfer.transferId);
+      const key = transferRateKey(transfer.terminalId, transfer.queueId, transfer.transferId);
       activeKeys.add(key);
 
       if (transfer.done || transfer.error) {
@@ -182,7 +182,7 @@ function ensureTransferRateTicker() {
 }
 
 function updateTransferRateSample(incoming: TransferState, now = Date.now()) {
-  const key = transferRateKey(incoming.terminalId, incoming.transferId);
+  const key = transferRateKey(incoming.terminalId, incoming.queueId, incoming.transferId);
   const existing = fileBrowser.transferRates[key];
   if (incoming.done || incoming.error) {
     setFileBrowser("transferRates", key, undefined!);
@@ -213,13 +213,25 @@ function updateTransferRateSample(incoming: TransferState, now = Date.now()) {
 }
 
 function upsertTransfer(incoming: TransferState) {
-  const index = fileBrowser.transfers.findIndex((item) => item.terminalId === incoming.terminalId && item.transferId === incoming.transferId);
+  const index = fileBrowser.transfers.findIndex((item) =>
+    item.terminalId === incoming.terminalId
+    && item.queueId === incoming.queueId
+    && item.transferId === incoming.transferId
+  );
   if (index >= 0) {
     setFileBrowser("transfers", index, incoming);
     return;
   }
 
-  setFileBrowser("transfers", (current) => [...current, incoming].slice(-6));
+  setFileBrowser("transfers", (current) => {
+    const next = [...current, incoming];
+    while (next.length > 6) {
+      const completedIndex = next.findIndex((item) => item.done || item.error);
+      if (completedIndex === -1) break;
+      next.splice(completedIndex, 1);
+    }
+    return next;
+  });
 }
 
 export function isSftpQueueCancelledError(error: unknown) {
@@ -260,9 +272,13 @@ export async function ensureSftpEventListeners() {
         window.setTimeout(() => {
           batch(() => {
             setFileBrowser("transfers", (current) =>
-              current.filter((item) => !(item.terminalId === incoming.terminalId && item.transferId === incoming.transferId))
+              current.filter((item) => !(
+                item.terminalId === incoming.terminalId
+                && item.queueId === incoming.queueId
+                && item.transferId === incoming.transferId
+              ))
             );
-            setFileBrowser("transferRates", transferRateKey(incoming.terminalId, incoming.transferId), undefined!);
+            setFileBrowser("transferRates", transferRateKey(incoming.terminalId, incoming.queueId, incoming.transferId), undefined!);
           });
         }, sftpProgressDismissDelay(incoming.error));
       }
@@ -412,8 +428,8 @@ export function getTransfersForTerminal(terminalId: string | null): TransferStat
   return terminalId ? fileBrowser.transfers.filter((transfer) => transfer.terminalId === terminalId) : [];
 }
 
-export function getTransferSpeed(terminalId: string, transferId: string): number | null {
-  return fileBrowser.transferRates[transferRateKey(terminalId, transferId)]?.bytesPerSecond ?? null;
+export function getTransferSpeed(terminalId: string, queueId: string, transferId: string): number | null {
+  return fileBrowser.transferRates[transferRateKey(terminalId, queueId, transferId)]?.bytesPerSecond ?? null;
 }
 
 export async function loadRemoteDirectory(terminalId: string, path?: string) {

@@ -273,12 +273,22 @@ export default function FileBrowser() {
     await loadRemoteDirectory(activeTerminalId, nextPath);
   };
 
-  const toggleHiddenFiles = async () => {
-    const activeTerminalId = terminalId();
-    if (!activeTerminalId) return;
-    setShowHiddenFiles(!fileBrowser.showHiddenFiles);
+  const toggleHiddenFiles = () => {
+    const showHidden = !fileBrowser.showHiddenFiles;
+    if (!showHidden) {
+      const visiblePaths = activeView().entries
+        .filter((entry) => !isHiddenEntry(entry))
+        .map((entry) => entry.path);
+      const visiblePathSet = new Set(visiblePaths);
+      const selectedPaths = activeView().selectedPaths.filter((path) => visiblePathSet.has(path));
+      const anchorPath = activeView().selectionAnchorPath;
+      setSelectedPaths(
+        selectedPaths,
+        anchorPath && visiblePathSet.has(anchorPath) ? anchorPath : selectedPaths[selectedPaths.length - 1] ?? null,
+      );
+    }
+    setShowHiddenFiles(showHidden);
     setContextMenu(null);
-    await loadRemoteDirectory(activeTerminalId);
   };
 
   const focusListing = () => {
@@ -346,17 +356,18 @@ export default function FileBrowser() {
     const visiblePaths = visibleEntries().map((item) => item.path);
     const currentSelection = new Set(activeView().selectedPaths);
 
-    if (event.ctrlKey && event.shiftKey) {
+    const additive = event.ctrlKey || event.metaKey;
+    if (event.shiftKey) {
       const anchorPath = activeView().selectionAnchorPath ?? entry.path;
-      const nextSelection = new Set(currentSelection);
+      const nextSelection = additive ? new Set(currentSelection) : new Set<string>();
       for (const path of selectionRange(visiblePaths, anchorPath, entry.path)) {
         nextSelection.add(path);
       }
-      setSelectedPaths(orderedSelection(visiblePaths, nextSelection), entry.path);
+      setSelectedPaths(orderedSelection(visiblePaths, nextSelection), anchorPath);
       return;
     }
 
-    if (event.ctrlKey) {
+    if (additive) {
       if (currentSelection.has(entry.path)) {
         currentSelection.delete(entry.path);
       } else {
@@ -677,7 +688,7 @@ export default function FileBrowser() {
               };
               const speedLabel = () => {
                 if (transfer.done || transfer.error || isCancelled()) return "";
-                return formatTransferSpeed(getTransferSpeed(transfer.terminalId, transfer.transferId));
+                return formatTransferSpeed(getTransferSpeed(transfer.terminalId, transfer.queueId, transfer.transferId));
               };
               const transferTitle = () => {
                 if (isCancelled()) {

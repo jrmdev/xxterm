@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -36,6 +36,8 @@ const EDIT_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EDIT_WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 const TRANSFER_BUFFER_SIZE: usize = 256 * 1024;
 const TRANSFER_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
+const SFTP_UPLOAD_CHUNK_SIZE: usize = 32 * 1024;
+const SFTP_UPLOAD_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SFTP_MAX_PACKET_LEN: u32 = 1024 * 1024;
 const SFTP_MAX_CONCURRENT_WRITES: usize = 32;
 const SFTP_REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -121,6 +123,12 @@ impl TransferCancelToken {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -432,6 +440,17 @@ fn local_download_path(id: &str, remote_path: &str) -> PathBuf {
     local_path
 }
 
+fn local_open_download_path(id: &str, remote_path: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    local_download_dir(id)
+        .join("open")
+        .join(nonce.to_string())
+        .join(remote_display_name(remote_path))
+}
+
 fn remote_display_name(path: &str) -> String {
     path.split('/')
         .rfind(|segment| !segment.is_empty() && *segment != ".")
@@ -443,6 +462,14 @@ fn remote_display_name(path: &str) -> String {
             }
         })
         .unwrap_or_else(|| "root".to_string())
+}
+
+fn local_name_collision_key(name: &str) -> String {
+    if cfg!(windows) {
+        name.to_lowercase()
+    } else {
+        name.to_string()
+    }
 }
 
 fn transfer_id_for_path(direction: &str, path: &str) -> String {
@@ -926,9 +953,9 @@ async fn sftp_upload_impl(
     let finish_queue_id = queue_id.clone();
     let transfer_id = transfer_id_for_path("upload", &remote_path);
     let display_path = remote_path.clone();
-    let result = with_sftp_session(state, &session_lookup_id, move |sftp, _| async move {
+    let result = with_sftp_session(state, &session_lookup_id, move |_, ssh_handle| async move {
         upload_local_file(
-            &sftp,
+            &ssh_handle,
             app,
             &lookup_id,
             session_id,
@@ -946,8 +973,32 @@ async fn sftp_upload_impl(
     result
 }
 
+async fn await_upload_operation<T, E, F>(
+    cancel: &TransferCancelToken,
+    context: &str,
+    operation: F,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    F: Future<Output = Result<T, E>>,
+{
+    tokio::select! {
+        _ = cancel.cancelled() => Err("Transfer canceled".to_string()),
+        result = tokio::time::timeout(SFTP_UPLOAD_OPERATION_TIMEOUT, operation) => {
+            match result {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(format!("{context}: {error}")),
+                Err(_) => Err(format!(
+                    "{context}: timed out after {} seconds",
+                    SFTP_UPLOAD_OPERATION_TIMEOUT.as_secs()
+                )),
+            }
+        }
+    }
+}
+
 async fn upload_local_file(
-    sftp: &SftpSession,
+    ssh_handle: &SharedSshHandle,
     app: &AppHandle,
     id: &str,
     session_id: i64,
@@ -988,56 +1039,76 @@ async fn upload_local_file(
         let mut local = fs::File::open(local_path)
             .await
             .map_err(|e| format!("Failed to open {}: {}", local_path.display(), e))?;
-        let mut remote = sftp
-            .open_with_flags(
+        let raw = await_upload_operation(
+            cancel,
+            "Failed to initialize SFTP upload session",
+            create_raw_sftp_session(ssh_handle),
+        )
+        .await?;
+        let handle = await_upload_operation(
+            cancel,
+            &format!("Failed to open {} for upload", remote_path),
+            raw.open(
                 remote_path,
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE | OpenFlags::READ,
-            )
-            .await
-            .map_err(|e| format!("Failed to open {} for upload: {}", remote_path, e))?;
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                FileAttributes::empty(),
+            ),
+        )
+        .await?
+        .handle;
 
-        let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
-        loop {
-            if cancel.is_cancelled() {
-                return Err("Transfer canceled".to_string());
-            }
-            let count = local
-                .read(&mut buffer)
-                .await
-                .map_err(|e| format!("Failed to read {}: {}", local_path.display(), e))?;
-            if count == 0 {
-                break;
-            }
-            remote
-                .write_all(&buffer[..count])
-                .await
-                .map_err(|e| format!("Failed to write {}: {}", remote_path, e))?;
-            transferred += count as u64;
-            if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
-                emit_transfer_progress(
-                    app,
-                    id,
-                    session_id,
-                    queue_id,
-                    transfer_id,
-                    "upload",
-                    remote_path,
-                    display_path,
-                    transferred,
-                    total,
-                    false,
-                    None,
+        let upload_result: Result<(), String> = async {
+            let mut buffer = vec![0_u8; SFTP_UPLOAD_CHUNK_SIZE];
+            loop {
+                if cancel.is_cancelled() {
+                    return Err("Transfer canceled".to_string());
+                }
+                let count = local
+                    .read(&mut buffer)
+                    .await
+                    .map_err(|e| format!("Failed to read {}: {}", local_path.display(), e))?;
+                if count == 0 {
+                    break;
+                }
+                await_upload_operation(
+                    cancel,
+                    &format!("Failed to write {}", remote_path),
+                    raw.write(handle.clone(), transferred, buffer[..count].to_vec()),
                 )
-                .await;
-                last_progress_emit = Instant::now();
+                .await?;
+                transferred += count as u64;
+                if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
+                    emit_transfer_progress(
+                        app,
+                        id,
+                        session_id,
+                        queue_id,
+                        transfer_id,
+                        "upload",
+                        remote_path,
+                        display_path,
+                        transferred,
+                        total,
+                        false,
+                        None,
+                    )
+                    .await;
+                    last_progress_emit = Instant::now();
+                }
             }
-        }
 
-        remote
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush {}: {}", remote_path, e))?;
-        Ok(())
+            await_upload_operation(
+                cancel,
+                &format!("Failed to close {} after upload", remote_path),
+                raw.close(handle),
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+
+        let _ = raw.close_session();
+        upload_result
     }
     .await;
 
@@ -1325,13 +1396,33 @@ async fn download_remote_tree_streaming(
         return Ok(());
     }
 
+    let mut local_names = HashSet::new();
     for entry in entries {
         if cancel.is_cancelled() {
             return Err("Download canceled".to_string());
         }
 
         let name = entry.file_name();
-        let child_local_path = local_path.join(sanitize_local_name(&name));
+        let local_name = sanitize_local_name(&name);
+        if !local_names.insert(local_name_collision_key(&local_name)) {
+            failures.push(format!(
+                "{} (local filename collides with another item after sanitization)",
+                entry.path()
+            ));
+            completed_entries = completed_entries.saturating_add(1);
+            progress
+                .emit(
+                    remote_path,
+                    &folder_name,
+                    completed_entries,
+                    Some(total_entries),
+                    false,
+                    None,
+                )
+                .await;
+            continue;
+        }
+        let child_local_path = local_path.join(local_name);
         let child_remote_path = entry.path();
         let child_file_type = entry.file_type();
 
@@ -1560,7 +1651,7 @@ pub async fn sftp_download(
 ) -> Result<String, String> {
     let remote_path = normalize_remote_path(&remote_path);
     let session_id = session_id_for_terminal(state.inner(), &id)?;
-    let local_path = local_download_path(&id, &remote_path);
+    let local_path = local_open_download_path(&id, &remote_path);
     sftp_download_impl(
         &app,
         state.inner(),
@@ -1588,16 +1679,26 @@ pub async fn sftp_download_selection(
 
     let session_id = session_id_for_terminal(state.inner(), &id)?;
     let destination_dir = PathBuf::from(destination_dir);
+    let normalized_paths = remote_paths
+        .into_iter()
+        .map(|path| normalize_remote_path(&path))
+        .collect::<Vec<_>>();
+    let mut local_names = HashSet::new();
+    for remote_path in &normalized_paths {
+        let local_name = remote_display_name(remote_path);
+        if !local_names.insert(local_name_collision_key(&local_name)) {
+            return Err(format!(
+                "Cannot download selection: multiple items map to the local name {}",
+                local_name
+            ));
+        }
+    }
     let transfer_id = batch_transfer_id(session_id);
     let queue_id = transfer_id.clone();
     let cancel = transfer_state.register_queue(&id, &queue_id)?;
     let finish_queue_id = queue_id.clone();
     let lookup_id = id.clone();
     let session_lookup_id = lookup_id.clone();
-    let normalized_paths = remote_paths
-        .into_iter()
-        .map(|path| normalize_remote_path(&path))
-        .collect::<Vec<_>>();
 
     let result = with_sftp_session(
         state.inner(),
@@ -1789,6 +1890,15 @@ pub async fn sftp_upload_selection(
             local_path: entry.local_path,
         })
         .collect::<Vec<_>>();
+    let mut remote_paths = HashSet::new();
+    for entry in &normalized {
+        if !remote_paths.insert(entry.remote_path.as_str()) {
+            return Err(format!(
+                "Cannot upload selection: multiple files target {}",
+                entry.remote_path
+            ));
+        }
+    }
 
     let lookup_id = id.clone();
     let session_lookup_id = lookup_id.clone();
@@ -1798,7 +1908,7 @@ pub async fn sftp_upload_selection(
     let result = with_sftp_session(
         state.inner(),
         &session_lookup_id,
-        move |sftp, _| async move {
+        move |_, ssh_handle| async move {
             let mut failures = Vec::new();
 
             for entry in &normalized {
@@ -1810,7 +1920,7 @@ pub async fn sftp_upload_selection(
                 let display_path = remote_display_name(&entry.remote_path);
 
                 if let Err(error) = upload_local_file(
-                    &sftp,
+                    &ssh_handle,
                     &app,
                     &lookup_id,
                     session_id,
@@ -2236,5 +2346,25 @@ pub fn cancel_sftp_queue(
     match transfer_state.cancel_queue(&id, &queue_id)? {
         true => Ok(()),
         false => Err("Transfer is no longer active".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_upload_operation_stops_when_cancelled() {
+        let cancel = TransferCancelToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            trigger.cancel();
+        });
+
+        let pending = std::future::pending::<Result<(), String>>();
+        let result = await_upload_operation(&cancel, "pending upload", pending).await;
+
+        assert_eq!(result, Err("Transfer canceled".to_string()));
     }
 }
