@@ -1616,12 +1616,21 @@ pub async fn sftp_list_dir(
 
             let metadata = entry.metadata();
             let file_type = entry.file_type();
+            let path = entry.path();
+            let is_symlink = file_type.is_symlink();
+            let is_dir = file_type.is_dir()
+                || (is_symlink
+                    && sftp
+                        .metadata(&path)
+                        .await
+                        .map(|target_metadata| target_metadata.file_type().is_dir())
+                        .unwrap_or(false));
 
             entries.push(FileEntry {
-                path: entry.path(),
+                path,
                 name,
-                is_dir: file_type.is_dir(),
-                is_symlink: file_type.is_symlink(),
+                is_dir,
+                is_symlink,
                 size: metadata.size,
                 modified: metadata.modified().ok().and_then(|time| {
                     time.duration_since(UNIX_EPOCH)

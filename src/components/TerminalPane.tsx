@@ -135,6 +135,25 @@ export default function TerminalPane() {
     setShowRenameDialog(true);
   };
 
+  const duplicateTab = (tabId: string) => {
+    const tab = terminals.list.find((terminal) => terminal.id === tabId);
+    setTabContextMenu(null);
+    if (!tab) return;
+
+    addTerminal(
+      tab.label,
+      tab.type,
+      tab.sessionId,
+      tab.profile,
+      tab.keyPassphrases?.map((input) => ({ ...input })),
+    );
+  };
+
+  const closeTabFromContextMenu = (tabId: string) => {
+    setTabContextMenu(null);
+    closeTab(tabId);
+  };
+
   const closeRenameDialog = () => {
     setShowRenameDialog(false);
     setRenameTabId(null);
@@ -642,6 +661,28 @@ export default function TerminalPane() {
             onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
           >
             Rename
+          </div>
+          <div
+            onClick={() => {
+              const ctx = tabContextMenu();
+              if (ctx) duplicateTab(ctx.tabId);
+            }}
+            style={menuItemStyle}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--app-surface-hover)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            Duplicate
+          </div>
+          <div
+            onClick={() => {
+              const ctx = tabContextMenu();
+              if (ctx) closeTabFromContextMenu(ctx.tabId);
+            }}
+            style={menuItemStyle}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--app-danger-bg)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            Close
           </div>
         </div>
       </Show>
