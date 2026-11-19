@@ -1,7 +1,7 @@
 import { createEffect, createSignal, onMount, onCleanup, Show } from "solid-js";
 import { Terminal as XTermTerminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
+import type { WebglAddon } from "@xterm/addon-webgl";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createPty, writePty, closePty, resizePty, connectSsh, readClipboard, type KeyPassphraseInput } from "../ipc/commands";
@@ -14,8 +14,13 @@ import type { TerminalExitEvent } from "../types/terminal";
 import { getColorScheme } from "../colorSchemes";
 import "@xterm/xterm/css/xterm.css";
 
+const terminalTextEncoder = new TextEncoder();
+const clipboardTextDecoder = new TextDecoder();
+const byteArray = Uint8Array as typeof Uint8Array & { fromBase64?: (value: string) => Uint8Array };
+
 function toBase64(str: string): string {
-  const bytes = new TextEncoder().encode(str);
+  const bytes = terminalTextEncoder.encode(str) as Uint8Array & { toBase64?: () => string };
+  if (bytes.toBase64) return bytes.toBase64();
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -40,6 +45,7 @@ function isWindowsPlatform() {
 }
 
 function base64ToBytes(b64: string): Uint8Array {
+  if (byteArray.fromBase64) return byteArray.fromBase64(b64);
   const binaryStr = atob(b64);
   const bytes = new Uint8Array(binaryStr.length);
   for (let i = 0; i < binaryStr.length; i++) {
@@ -50,7 +56,7 @@ function base64ToBytes(b64: string): Uint8Array {
 
 function decodeBase64Utf8(b64: string): string | null {
   try {
-    return new TextDecoder().decode(base64ToBytes(b64));
+    return clipboardTextDecoder.decode(base64ToBytes(b64));
   } catch {
     return null;
   }
@@ -82,10 +88,14 @@ export default function TerminalTab(props: Props) {
   let term: XTermTerminal | undefined;
   let fitAddon: FitAddon | undefined;
   let webglAddon: WebglAddon | undefined;
+  let webglLoading = false;
+  let webglUnavailable = false;
   let unlistenOutput: (() => void) | undefined;
   let unlistenExit: (() => void) | undefined;
   let resizeObserver: ResizeObserver | undefined;
-  let resizeFrame: number | undefined;
+  let layoutFrame: number | undefined;
+  let focusRequested = false;
+  let atlasRefreshRequested = false;
   let copySelectionFrame: number | undefined;
   let flashSelectionTimer: ReturnType<typeof setTimeout> | undefined;
   let selectionMouseDownHandler: ((event: MouseEvent) => void) | undefined;
@@ -97,8 +107,11 @@ export default function TerminalTab(props: Props) {
   let suppressNativeMousePasteUntil = 0;
   let middleClickPastedOnMouseDown = false;
   let suppressUnseenActivityUntil = 0;
-  let lastReportedSize: { cols: number; rows: number } | null = null;
+  let sessionReady = false;
+  let disposed = false;
   let exited = false;
+  let restarting = false;
+  let unseenActivity = false;
   const windowsPlatform = isWindowsPlatform();
   const selectionFlashDurationMs = 100;
   const resizeActivitySuppressionMs = 400;
@@ -107,13 +120,8 @@ export default function TerminalTab(props: Props) {
   const closeContextMenu = () => setContextMenu(null);
 
   const focusTerminal = () => {
-    requestAnimationFrame(() => {
-      fitTerminal();
-      if (term) {
-        term.refresh(0, Math.max(0, term.rows - 1));
-      }
-      term?.focus();
-    });
+    focusRequested = true;
+    scheduleTerminalLayout();
   };
 
   const getTerminalSize = () => ({
@@ -123,18 +131,17 @@ export default function TerminalTab(props: Props) {
 
   const handleUnexpectedExit = (event?: TerminalExitEvent) => {
     exited = true;
+    sessionReady = false;
     setTerminalExited(props.id, true);
     if (props.type === "ssh") {
       setTerminalConnectionState(props.id, "disconnected");
       syncSidebarWithActiveTerminal(true);
     }
-    term?.write(`\r\n\x1b[31m${event?.message || "[Process exited]"}\x1b[0m\r\n`);
-    term?.write("\r\n\x1b[31m      - Press \"r\" to restart\x1b[0m");
-    term?.write("\r\n\x1b[31m      - Press \"q\" to close\x1b[0m\r\n");
-    if (term && props.active) {
-      term.refresh(0, Math.max(0, term.rows - 1));
-    }
+    term?.write(`\r\n\x1b[31m${event?.message || "[Process exited]"}\x1b[0m\r\n`
+      + "\r\n\x1b[31m      - Press \"r\" to restart\x1b[0m"
+      + "\r\n\x1b[31m      - Press \"q\" to close\x1b[0m\r\n");
     if (!props.active) {
+      unseenActivity = true;
       setTerminalUnseenActivity(props.id, true);
     }
   };
@@ -254,47 +261,59 @@ export default function TerminalTab(props: Props) {
   };
 
   const fitTerminal = () => {
-    if (resizeFrame !== undefined) {
-      cancelAnimationFrame(resizeFrame);
+    if (!props.active) return;
+    try {
+      fitAddon?.fit();
+    } catch {
     }
-    resizeFrame = requestAnimationFrame(() => {
-      resizeFrame = undefined;
-      try {
-        fitAddon?.fit();
-      } catch {
+  };
+
+  const scheduleTerminalLayout = () => {
+    if (!props.active || !term || layoutFrame !== undefined) return;
+    layoutFrame = requestAnimationFrame(() => {
+      layoutFrame = undefined;
+      if (!props.active || !term) return;
+      fitTerminal();
+      if (atlasRefreshRequested) {
+        atlasRefreshRequested = false;
+        term.clearTextureAtlas();
+      }
+      if (focusRequested) {
+        focusRequested = false;
+        term.refresh(0, term.rows - 1);
+        term.focus();
+        void loadWebglRenderer();
       }
     });
   };
 
-  const loadWebglRenderer = () => {
-    if (!term || webglAddon) return;
+  const loadWebglRenderer = async () => {
+    if (!props.active || !term || webglAddon || webglLoading || webglUnavailable) return;
+    webglLoading = true;
 
     try {
+      const { WebglAddon } = await import("@xterm/addon-webgl");
+      if (!props.active || !term) return;
       const addon = new WebglAddon();
       addon.onContextLoss(() => {
-        console.warn("WebGL context lost");
-        if (webglAddon === addon) {
-          addon.dispose();
-          webglAddon = undefined;
-        }
-
-        // Fall back briefly, then try to restore the accelerated renderer for this tab.
-        window.setTimeout(() => {
-          if (!term || webglAddon) return;
-          loadWebglRenderer();
-          term?.clearTextureAtlas();
-          fitTerminal();
-        }, 0);
+        if (webglAddon !== addon) return;
+        addon.dispose();
+        webglAddon = undefined;
+        // Keep hidden tabs on the fallback renderer until they are next shown.
+        void loadWebglRenderer();
       });
       term.loadAddon(addon);
       webglAddon = addon;
+      scheduleTerminalLayout();
     } catch (e) {
-      webglAddon = undefined;
+      webglUnavailable = true;
       console.warn("WebGL addon failed to load:", e);
+    } finally {
+      webglLoading = false;
     }
   };
 
-  onMount(async () => {
+  onMount(() => {
     if (!terminalRef) return;
 
     term = new XTermTerminal({
@@ -325,9 +344,7 @@ export default function TerminalTab(props: Props) {
     term.loadAddon(fitAddon);
 
     term.open(terminalRef);
-    loadWebglRenderer();
-    fitTerminal();
-    focusTerminal();
+    if (props.active) focusTerminal();
 
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
@@ -432,11 +449,9 @@ export default function TerminalTab(props: Props) {
     });
 
     term.onResize(({ cols, rows }) => {
-      if (lastReportedSize && (lastReportedSize.cols !== cols || lastReportedSize.rows !== rows)) {
-        suppressUnseenActivityUntil = Date.now() + resizeActivitySuppressionMs;
-      }
-      lastReportedSize = { cols, rows };
-      resizePty(props.id, cols, rows);
+      if (!sessionReady) return;
+      suppressUnseenActivityUntil = Date.now() + resizeActivitySuppressionMs;
+      void resizePty(props.id, cols, rows);
     });
 
     term.onData((data) => {
@@ -455,16 +470,17 @@ export default function TerminalTab(props: Props) {
       writePty(props.id, binaryStringToBase64(data));
     });
 
-    unlistenOutput = await listen<string>(`pty-output-${props.id}`, (event) => {
+    const handleOutput = (event: { payload: string }) => {
       if (!term) return;
       try {
         term.write(base64ToBytes(event.payload));
       } catch {
       }
-      if (!props.active && Date.now() > suppressUnseenActivityUntil) {
+      if (!props.active && !unseenActivity && Date.now() > suppressUnseenActivityUntil) {
+        unseenActivity = true;
         setTerminalUnseenActivity(props.id, true);
       }
-    });
+    };
 
     const handleExitEvent = (event: { payload?: TerminalExitEvent }) => {
       if (event.payload?.initiatedByUser) return;
@@ -473,18 +489,33 @@ export default function TerminalTab(props: Props) {
 
     async function startSession(failureMessage: string): Promise<boolean> {
       try {
+        fitTerminal();
         const { cols, rows } = getTerminalSize();
         if (props.type === "ssh" && props.sessionId) {
           setTerminalConnectionState(props.id, "connecting");
           setSidebarPane("sftp");
           await connectSsh(props.id, props.sessionId, cols, rows, props.keyPassphrases);
-          setTerminalConnectionState(props.id, "connected");
-          void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
         } else {
           await createPty(props.id, cols, rows, props.profile);
         }
+        if (disposed) {
+          await closePty(props.id);
+          return false;
+        }
+        if (exited) return false;
+
+        sessionReady = true;
+        const latest = getTerminalSize();
+        if (latest.cols !== cols || latest.rows !== rows) {
+          void resizePty(props.id, latest.cols, latest.rows);
+        }
+        if (props.type === "ssh" && props.sessionId) {
+          setTerminalConnectionState(props.id, "connected");
+          void autoStartPortForwards(props.sessionId, props.id, props.keyPassphrases);
+        }
         return true;
       } catch (e) {
+        if (disposed) return false;
         if (props.type === "ssh") {
           setTerminalConnectionState(props.id, "disconnected");
           syncSidebarWithActiveTerminal(true);
@@ -495,29 +526,55 @@ export default function TerminalTab(props: Props) {
     }
 
     async function restart() {
-      unlistenExit?.();
-      await closePty(props.id);
-      term?.write("\r\n\x1b[32mRestarting...\x1b[0m\r\n");
-      exited = false;
-      unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, handleExitEvent);
-      if (await startSession("Failed to restart")) {
-        setTerminalExited(props.id, false);
-        term?.write("\x1b[2J\x1b[H");
+      if (restarting) return;
+      restarting = true;
+      try {
+        unlistenExit?.();
+        unlistenExit = undefined;
+        await closePty(props.id);
+        if (disposed) return;
+        term?.write("\r\n\x1b[32mRestarting...\x1b[0m\r\n");
+        await subscribeToExit();
+        if (disposed) return;
+        exited = false;
+        if (await startSession("Failed to restart")) {
+          setTerminalExited(props.id, false);
+          term?.write("\x1b[2J\x1b[H");
+        } else {
+          exited = true;
+        }
+      } catch (error) {
+        term?.write(`\r\n\x1b[31mFailed to restart: ${error}\x1b[0m`);
+      } finally {
+        restarting = false;
       }
     }
 
-    unlistenExit = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, handleExitEvent);
+    const subscribeToExit = async () => {
+      const unlisten = await listen<TerminalExitEvent>(`pty-exit-${props.id}`, handleExitEvent);
+      if (disposed) unlisten();
+      else unlistenExit = unlisten;
+    };
 
-    await startSession("Failed to start terminal");
+    void Promise.all([
+      listen<string>(`pty-output-${props.id}`, handleOutput).then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenOutput = unlisten;
+      }),
+      subscribeToExit(),
+    ]).then(() => {
+      if (!disposed) return startSession("Failed to start terminal");
+    }).catch((error) => {
+      term?.write(`\r\n\x1b[31mFailed to listen for terminal events: ${error}\x1b[0m`);
+    });
 
-    resizeObserver = new ResizeObserver(fitTerminal);
+    resizeObserver = new ResizeObserver(scheduleTerminalLayout);
     resizeObserver.observe(terminalRef);
 
-    const handleWindowFocus = () => {
-      term?.clearTextureAtlas();
-      if (props.active) {
-        focusTerminal();
-      }
+    const handleWindowFocus = (event: Event) => {
+      if (!props.active || document.hidden) return;
+      if (event.type === "visibilitychange") atlasRefreshRequested = true;
+      focusTerminal();
     };
     window.addEventListener("focus", handleWindowFocus);
     document.addEventListener("visibilitychange", handleWindowFocus);
@@ -531,7 +588,6 @@ export default function TerminalTab(props: Props) {
     const colorScheme = getColorScheme(settings.colorSchemeId);
     if (!term) return;
     term.options.theme = colorScheme.xterm;
-    fitTerminal();
   });
 
   createEffect(() => {
@@ -540,19 +596,21 @@ export default function TerminalTab(props: Props) {
     if (!term) return;
     term.options.fontFamily = fontFamily;
     term.options.fontSize = fontSize;
-    fitTerminal();
+    scheduleTerminalLayout();
   });
 
   createEffect(() => {
     if (props.active) {
+      unseenActivity = false;
       focusTerminal();
     }
   });
 
   onCleanup(() => {
+    disposed = true;
     resizeObserver?.disconnect();
-    if (resizeFrame !== undefined) {
-      cancelAnimationFrame(resizeFrame);
+    if (layoutFrame !== undefined) {
+      cancelAnimationFrame(layoutFrame);
     }
     if (copySelectionFrame !== undefined) {
       cancelAnimationFrame(copySelectionFrame);
@@ -585,19 +643,20 @@ export default function TerminalTab(props: Props) {
     }
     syncSidebarWithActiveTerminal(true);
     term?.dispose();
+    term = undefined;
   });
 
   const zoomIn = () => {
     if (!term) return;
     term.options.fontSize = Math.min(40, (term.options.fontSize || 14) + 1);
-    fitTerminal();
+    scheduleTerminalLayout();
     closeContextMenu();
   };
 
   const zoomOut = () => {
     if (!term) return;
     term.options.fontSize = Math.max(8, (term.options.fontSize || 14) - 1);
-    fitTerminal();
+    scheduleTerminalLayout();
     closeContextMenu();
   };
 

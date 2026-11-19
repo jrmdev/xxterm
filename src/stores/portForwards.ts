@@ -259,6 +259,7 @@ export async function loadSidebarPortForwards(sessionList: Session[]) {
 
 export async function refreshSidebarPortForwardStatus(sessionList: Session[]) {
   try {
+    const sessionIds = new Set(sessionList.map((session) => session.id));
     const statusEntries = await Promise.all(
       sessionList.map(async (session) => ({
         statuses: await apiGetPortForwardStatus(session.id),
@@ -272,6 +273,7 @@ export async function refreshSidebarPortForwardStatus(sessionList: Session[]) {
     }
     setPortForwards("sidebarList", (current) =>
       current.map((forward) => {
+        if (!sessionIds.has(forward.session_id)) return forward;
         const status = statusById.get(forward.id);
         return {
           ...forward,

@@ -12,6 +12,21 @@ export interface PrivateKeyPassphraseStatus {
   error: string | null;
 }
 
+export type AdminShell = "cmd" | "powershell";
+
+export interface AdminTerminal {
+  shell: AdminShell;
+  program: string;
+}
+
+export function getStartupAdminTerminal(): Promise<AdminTerminal | null> {
+  return invoke("get_startup_admin_terminal");
+}
+
+export function openAdminTerminal(shell: AdminShell): Promise<AdminTerminal | null> {
+  return invoke("open_admin_terminal", { shell });
+}
+
 export async function createPty(id: string, cols: number, rows: number, profile?: TerminalProfile): Promise<void> {
   await invoke("create_pty", {
     id,

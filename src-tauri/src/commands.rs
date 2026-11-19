@@ -67,8 +67,14 @@ pub fn update_session(
 }
 
 #[tauri::command]
-pub fn delete_session(store: tauri::State<'_, SessionStore>, id: i64) -> Result<(), String> {
-    store.delete_session(id)
+pub fn delete_session(
+    store: tauri::State<'_, SessionStore>,
+    pf_state: tauri::State<'_, crate::port_forward::PortForwardState>,
+    id: i64,
+) -> Result<(), String> {
+    store.delete_session(id)?;
+    pf_state.cancel_session(id, None);
+    Ok(())
 }
 
 #[tauri::command]
@@ -356,24 +362,25 @@ pub fn create_port_forward(
 #[tauri::command]
 pub async fn update_port_forward(
     store: tauri::State<'_, SessionStore>,
-    state: tauri::State<'_, MasterPasswordState>,
     pf_state: tauri::State<'_, crate::port_forward::PortForwardState>,
-    ssh_state: tauri::State<'_, crate::ssh::SshState>,
     app: tauri::AppHandle,
     id: i64,
     input: UpdatePortForwardInput,
 ) -> Result<PortForward, String> {
     let updated = store.update_port_forward(id, input)?;
-    crate::port_forward::restart_forward_if_running(
-        &updated, &pf_state, &state, &ssh_state, &store, &app,
-    )
-    .await?;
+    crate::port_forward::restart_forward_if_running(updated.clone(), &pf_state, &app).await?;
     Ok(updated)
 }
 
 #[tauri::command]
-pub fn delete_port_forward(store: tauri::State<'_, SessionStore>, id: i64) -> Result<(), String> {
-    store.delete_port_forward(id)
+pub fn delete_port_forward(
+    store: tauri::State<'_, SessionStore>,
+    pf_state: tauri::State<'_, crate::port_forward::PortForwardState>,
+    id: i64,
+) -> Result<(), String> {
+    store.delete_port_forward(id)?;
+    pf_state.cancel_forward(id, None);
+    Ok(())
 }
 
 #[tauri::command]

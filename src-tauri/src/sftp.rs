@@ -8,8 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{stream::FuturesUnordered, StreamExt};
 use russh::ChannelMsg;
-use russh_sftp::client::{Config as SftpConfig, RawSftpSession, SftpSession};
-use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use russh_sftp::client::{
+    error::Error as SftpError, Config as SftpConfig, RawSftpSession, SftpSession,
+};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode, Version};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
@@ -40,10 +42,66 @@ const SFTP_UPLOAD_CHUNK_SIZE: usize = 32 * 1024;
 const SFTP_UPLOAD_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const SFTP_MAX_PACKET_LEN: u32 = 1024 * 1024;
 const SFTP_MAX_CONCURRENT_WRITES: usize = 32;
+const SFTP_UPLOAD_WRITE_DEPTH: usize = 16;
+const POSIX_RENAME: &str = "posix-rename@openssh.com";
 const SFTP_REQUEST_TIMEOUT_SECS: u64 = 300;
 const PIPELINED_DOWNLOAD_MIN_SIZE: u64 = 8 * 1024 * 1024;
 const PIPELINED_READ_SIZE: u64 = 16 * 1024;
 const PIPELINED_READ_DEPTH: usize = 64;
+
+fn transfer_staging_name() -> Result<String, String> {
+    let nonce = ring::rand::generate::<[u8; 16]>(&ring::rand::SystemRandom::new())
+        .map_err(|_| "Failed to generate a temporary transfer filename".to_string())?;
+    Ok(format!(
+        ".xxterm-{:032x}.part",
+        u128::from_be_bytes(nonce.expose())
+    ))
+}
+
+async fn create_local_download(destination: &Path) -> Result<(fs::File, PathBuf), String> {
+    let staging_path = destination.with_file_name(transfer_staging_name()?);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging_path)
+        .await
+        .map_err(|e| {
+            format!(
+                "Failed to create a temporary file for {}: {e}",
+                destination.display()
+            )
+        })?;
+    Ok((file, staging_path))
+}
+
+async fn finish_local_download(
+    mut file: fs::File,
+    staging_path: &Path,
+    destination: &Path,
+    result: Result<(), String>,
+    cancel: &TransferCancelToken,
+) -> Result<(), String> {
+    let flush_result = file
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush {}: {e}", destination.display()));
+    drop(file);
+
+    let result = async {
+        result.and(flush_result)?;
+        if cancel.is_cancelled() {
+            return Err("Download canceled".to_string());
+        }
+        fs::rename(staging_path, destination)
+            .await
+            .map_err(|e| format!("Failed to save {}: {e}", destination.display()))
+    }
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(staging_path).await;
+    }
+    result
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,26 +280,6 @@ impl SftpEditState {
         Ok((generation, stop_rx))
     }
 
-    pub fn stop_watcher(&self, terminal_id: &str, remote_path: &str) -> Result<(), String> {
-        let removed = {
-            let mut watchers = self.watchers.lock().map_err(|e| e.to_string())?;
-            let Some(terminal_watchers) = watchers.get_mut(terminal_id) else {
-                return Ok(());
-            };
-            let removed = terminal_watchers.remove(remote_path);
-            if terminal_watchers.is_empty() {
-                watchers.remove(terminal_id);
-            }
-            removed
-        };
-
-        if let Some(handle) = removed {
-            let _ = handle.stop_tx.send(true);
-        }
-
-        Ok(())
-    }
-
     pub fn stop_terminal(&self, terminal_id: &str) -> Result<(), String> {
         let removed = self
             .watchers
@@ -306,7 +344,7 @@ async fn create_sftp_session(shared_handle: &SharedSshHandle) -> Result<SftpSess
 
 async fn create_raw_sftp_session(
     shared_handle: &SharedSshHandle,
-) -> Result<Arc<RawSftpSession>, String> {
+) -> Result<(Arc<RawSftpSession>, Version), String> {
     let channel = {
         let handle = shared_handle.lock().await;
         handle
@@ -321,11 +359,11 @@ async fn create_raw_sftp_session(
         .map_err(|e| format!("Failed to start SFTP subsystem: {}", e))?;
 
     let session = RawSftpSession::new_with_config(channel.into_stream(), sftp_config());
-    session
+    let version = session
         .init()
         .await
         .map_err(|e| format!("Failed to initialize SFTP session: {}", e))?;
-    Ok(Arc::new(session))
+    Ok((Arc::new(session), version))
 }
 
 fn sftp_config() -> SftpConfig {
@@ -390,7 +428,7 @@ fn normalize_remote_path(path: &str) -> String {
     if path.is_empty() {
         "/".to_string()
     } else {
-        path.replace('\\', "/")
+        path.to_string()
     }
 }
 
@@ -417,27 +455,11 @@ fn sanitize_local_name(segment: &str) -> String {
     }
 }
 
-fn local_download_path(id: &str, remote_path: &str) -> PathBuf {
-    let mut local_path = local_download_dir(id);
-    let mut segments = remote_path
-        .split('/')
-        .filter(|segment| !segment.is_empty() && *segment != ".")
-        .peekable();
-
-    if segments.peek().is_none() {
-        return local_path.join("root");
-    }
-
-    for segment in segments {
-        let sanitized = if segment == ".." {
-            "__parent__".to_string()
-        } else {
-            sanitize_local_name(segment)
-        };
-        local_path.push(sanitized);
-    }
-
-    local_path
+fn local_download_path(id: &str, remote_path: &str) -> Result<PathBuf, String> {
+    Ok(local_download_dir(id)
+        .join("edit")
+        .join(transfer_staging_name()?)
+        .join(remote_display_name(remote_path)))
 }
 
 fn local_open_download_path(id: &str, remote_path: &str) -> PathBuf {
@@ -630,12 +652,16 @@ async fn download_remote_file_pipelined(
     transferred: &mut u64,
     last_progress_emit: &mut Instant,
 ) -> Result<(), String> {
-    let raw = create_raw_sftp_session(ssh_handle).await?;
-    let handle = raw
-        .open(remote_path, OpenFlags::READ, FileAttributes::empty())
-        .await
-        .map_err(|e| format!("Failed to open {}: {}", remote_path, e))?
-        .handle;
+    let (raw, _) = tokio::select! {
+        _ = cancel.cancelled() => return Err("Download canceled".to_string()),
+        session = create_raw_sftp_session(ssh_handle) => session?,
+    };
+    let handle = tokio::select! {
+        _ = cancel.cancelled() => return Err("Download canceled".to_string()),
+        opened = raw.open(remote_path, OpenFlags::READ, FileAttributes::empty()) => {
+            opened.map_err(|e| format!("Failed to open {remote_path}: {e}"))?.handle
+        }
+    };
 
     let mut reads = FuturesUnordered::new();
     let mut pending = BTreeMap::<u64, Vec<u8>>::new();
@@ -648,16 +674,22 @@ async fn download_remote_file_pipelined(
                 return Err("Transfer canceled".to_string());
             }
 
-            while reads.len() < PIPELINED_READ_DEPTH && next_request_offset < file_size {
-                let len = (file_size - next_request_offset).min(PIPELINED_READ_SIZE) as usize;
-                queue_pipelined_read(&mut reads, &raw, &handle, next_request_offset, len);
-                next_request_offset += len as u64;
+            let window_end = next_write_offset
+                .saturating_add(PIPELINED_READ_SIZE * PIPELINED_READ_DEPTH as u64)
+                .min(file_size);
+            while reads.len() < PIPELINED_READ_DEPTH && next_request_offset < window_end {
+                let len = (file_size - next_request_offset).min(PIPELINED_READ_SIZE);
+                if len > window_end - next_request_offset {
+                    break;
+                }
+                queue_pipelined_read(&mut reads, &raw, &handle, next_request_offset, len as usize);
+                next_request_offset += len;
             }
 
-            let chunk = reads
-                .next()
-                .await
-                .ok_or_else(|| "SFTP read pipeline stalled".to_string())??;
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => return Err("Download canceled".to_string()),
+                chunk = reads.next() => chunk.ok_or_else(|| "SFTP read pipeline stalled".to_string())??,
+            };
 
             if chunk.data.is_empty() {
                 return Err(format!("Unexpected EOF reading {}", remote_path));
@@ -711,13 +743,23 @@ async fn download_remote_file_pipelined(
     }
     .await;
 
-    let close_result = raw
-        .close(handle)
-        .await
-        .map_err(|e| format!("Failed to close {}: {}", remote_path, e));
+    if result.is_err() {
+        let _ = raw.close_session();
+        return result;
+    }
+    let close_result = tokio::select! {
+        _ = cancel.cancelled() => Err("Download canceled".to_string()),
+        result = async {
+            let metadata = raw.fstat(&handle).await
+                .map_err(|e| format!("Failed to verify {remote_path}: {e}"))?;
+            if metadata.attrs.size.is_some_and(|size| size != file_size) {
+                return Err(format!("{remote_path} changed size during download"));
+            }
+            raw.close(handle).await.map_err(|e| format!("Failed to close {remote_path}: {e}"))
+        } => result.map(|_| ()),
+    };
     let _ = raw.close_session();
 
-    result?;
     close_result?;
     Ok(())
 }
@@ -728,6 +770,17 @@ async fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
         len: metadata.len(),
         modified_at: metadata.modified().ok(),
     })
+}
+
+async fn await_download_operation<T, E: std::fmt::Display>(
+    cancel: &TransferCancelToken,
+    context: &str,
+    operation: impl Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err("Download canceled".to_string()),
+        result = operation => result.map_err(|error| format!("{context}: {error}")),
+    }
 }
 
 async fn download_remote_file(
@@ -748,13 +801,15 @@ async fn download_remote_file(
         return Err("Transfer canceled".to_string());
     }
 
-    let metadata = sftp
-        .metadata(remote_path)
-        .await
-        .map_err(|e| format!("Failed to inspect {}: {}", remote_path, e))?;
+    let metadata = await_download_operation(
+        cancel,
+        &format!("Failed to inspect {remote_path}"),
+        sftp.metadata(remote_path),
+    )
+    .await?;
 
     let file_size = metadata.len();
-    let total = Some(file_size);
+    let total = metadata.size;
     emit_transfer_progress(
         app,
         id,
@@ -774,75 +829,80 @@ async fn download_remote_file(
     let mut transferred = 0_u64;
     let mut last_progress_emit = Instant::now();
     let result: Result<String, String> = async {
-        let mut local = fs::File::create(local_path)
-            .await
-            .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
-
-        if file_size >= PIPELINED_DOWNLOAD_MIN_SIZE {
-            download_remote_file_pipelined(
-                ssh_handle,
-                app,
-                id,
-                session_id,
-                remote_path,
-                local_path,
-                &mut local,
-                queue_id,
-                transfer_id,
-                display_path,
-                cancel,
-                file_size,
-                &mut transferred,
-                &mut last_progress_emit,
-            )
-            .await?;
-        } else {
-            let mut remote = sftp
-                .open(remote_path)
-                .await
-                .map_err(|e| format!("Failed to open {}: {}", remote_path, e))?;
-            let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
-            loop {
-                if cancel.is_cancelled() {
-                    return Err("Transfer canceled".to_string());
-                }
-                let count = remote
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| format!("Failed to read {}: {}", remote_path, e))?;
-                if count == 0 {
-                    break;
-                }
-                local
-                    .write_all(&buffer[..count])
-                    .await
-                    .map_err(|e| format!("Failed to write {}: {}", local_path.display(), e))?;
-                transferred += count as u64;
-                if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
-                    emit_transfer_progress(
-                        app,
-                        id,
-                        session_id,
-                        queue_id,
-                        transfer_id,
-                        "download",
-                        remote_path,
-                        display_path,
-                        transferred,
-                        total,
-                        false,
-                        None,
-                    )
-                    .await;
-                    last_progress_emit = Instant::now();
+        let (mut local, staging_path) = create_local_download(local_path).await?;
+        let copy_result = async {
+            if file_size >= PIPELINED_DOWNLOAD_MIN_SIZE {
+                download_remote_file_pipelined(
+                    ssh_handle,
+                    app,
+                    id,
+                    session_id,
+                    remote_path,
+                    local_path,
+                    &mut local,
+                    queue_id,
+                    transfer_id,
+                    display_path,
+                    cancel,
+                    file_size,
+                    &mut transferred,
+                    &mut last_progress_emit,
+                )
+                .await?;
+            } else {
+                let mut remote = await_download_operation(
+                    cancel,
+                    &format!("Failed to open {remote_path}"),
+                    sftp.open(remote_path),
+                )
+                .await?;
+                let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
+                loop {
+                    if cancel.is_cancelled() {
+                        return Err("Transfer canceled".to_string());
+                    }
+                    let count = tokio::select! {
+                        _ = cancel.cancelled() => return Err("Download canceled".to_string()),
+                        read = remote.read(&mut buffer) => {
+                            read.map_err(|e| format!("Failed to read {}: {}", remote_path, e))?
+                        },
+                    };
+                    if count == 0 {
+                        break;
+                    }
+                    local
+                        .write_all(&buffer[..count])
+                        .await
+                        .map_err(|e| format!("Failed to write {}: {}", local_path.display(), e))?;
+                    transferred += count as u64;
+                    if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
+                        emit_transfer_progress(
+                            app,
+                            id,
+                            session_id,
+                            queue_id,
+                            transfer_id,
+                            "download",
+                            remote_path,
+                            display_path,
+                            transferred,
+                            total,
+                            false,
+                            None,
+                        )
+                        .await;
+                        last_progress_emit = Instant::now();
+                    }
                 }
             }
-        }
 
-        local
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush {}: {}", local_path.display(), e))?;
+            if total.is_some_and(|size| size != transferred) {
+                return Err(format!("{remote_path} changed size during download"));
+            }
+            Ok(())
+        }
+        .await;
+        finish_local_download(local, &staging_path, local_path, copy_result, cancel).await?;
         Ok(local_path.to_string_lossy().to_string())
     }
     .await;
@@ -867,7 +927,6 @@ async fn download_remote_file(
             Ok(local_path)
         }
         Err(error) => {
-            let _ = fs::remove_file(local_path).await;
             if finalize {
                 emit_transfer_error(
                     app,
@@ -944,33 +1003,39 @@ async fn sftp_upload_impl(
     remote_path: &str,
     local_path: &Path,
 ) -> Result<(), String> {
-    let lookup_id = id.to_string();
-    let session_lookup_id = lookup_id.clone();
-    let remote_path = remote_path.to_string();
-    let local_path = local_path.to_path_buf();
+    let ssh_handle = upload_ssh_handle(state, id)?;
     let queue_id = queue_id("upload", session_id);
     let cancel = transfer_state.register_queue(id, &queue_id)?;
-    let finish_queue_id = queue_id.clone();
-    let transfer_id = transfer_id_for_path("upload", &remote_path);
-    let display_path = remote_path.clone();
-    let result = with_sftp_session(state, &session_lookup_id, move |_, ssh_handle| async move {
-        upload_local_file(
-            &ssh_handle,
-            app,
-            &lookup_id,
-            session_id,
-            &remote_path,
-            &local_path,
-            &queue_id,
-            &transfer_id,
-            &display_path,
-            &cancel,
-        )
-        .await
-    })
+    let transfer_id = transfer_id_for_path("upload", remote_path);
+    let progress = UploadProgress {
+        app,
+        id,
+        session_id,
+        queue_id: &queue_id,
+        transfer_id: &transfer_id,
+        finalize: true,
+    };
+    let result = upload_local_file(
+        &ssh_handle,
+        &progress,
+        remote_path,
+        local_path,
+        remote_path,
+        &cancel,
+    )
     .await;
-    transfer_state.finish_queue(id, &finish_queue_id)?;
+    transfer_state.finish_queue(id, &queue_id)?;
     result
+}
+
+fn upload_ssh_handle(state: &SshState, id: &str) -> Result<SharedSshHandle, String> {
+    state
+        .ssh_handles
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "SFTP is only available while an SSH session is connected".to_string())
 }
 
 async fn await_upload_operation<T, E, F>(
@@ -997,158 +1062,324 @@ where
     }
 }
 
+async fn remote_upload_destination(
+    raw: &RawSftpSession,
+    remote_path: &str,
+    cancel: &TransferCancelToken,
+) -> Result<Option<FileAttributes>, String> {
+    await_upload_operation(cancel, &format!("Failed to inspect {remote_path}"), async {
+        match raw.lstat(remote_path).await {
+            Ok(metadata) => Ok(Some(metadata.attrs)),
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    })
+    .await
+}
+
+async fn commit_remote_upload(
+    raw: &RawSftpSession,
+    staging_path: &str,
+    remote_path: &str,
+    replace: bool,
+) -> Result<(), String> {
+    if replace {
+        let payload = russh_sftp::ser::to_bytes(&(staging_path, remote_path))
+            .map_err(|e| format!("Failed to encode upload destination: {e}"))?;
+        match raw.extended(POSIX_RENAME, payload.to_vec()).await {
+            Ok(Packet::Status(status)) if status.status_code == StatusCode::Ok => Ok(()),
+            Ok(Packet::Status(status)) => Err(format!(
+                "{:?}: {}",
+                status.status_code, status.error_message
+            )),
+            Ok(_) => Err("Unexpected reply while publishing upload".to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        raw.rename(staging_path, remote_path)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct UploadProgress<'a> {
+    app: &'a AppHandle,
+    id: &'a str,
+    session_id: i64,
+    queue_id: &'a str,
+    transfer_id: &'a str,
+    finalize: bool,
+}
+
+async fn resolve_upload_link(
+    raw: &RawSftpSession,
+    path: &str,
+    cancel: &TransferCancelToken,
+) -> Result<String, String> {
+    let names = await_upload_operation(
+        cancel,
+        "Failed to resolve upload symlink",
+        raw.realpath(path),
+    )
+    .await?;
+    names
+        .files
+        .into_iter()
+        .next()
+        .map(|file| file.filename)
+        .ok_or_else(|| format!("Could not resolve the destination of {path}"))
+}
+
+impl UploadProgress<'_> {
+    async fn emit(
+        &self,
+        path: &str,
+        display_path: &str,
+        transferred: u64,
+        total: Option<u64>,
+        done: bool,
+        error: Option<String>,
+    ) {
+        emit_transfer_progress(
+            self.app,
+            self.id,
+            self.session_id,
+            self.queue_id,
+            self.transfer_id,
+            "upload",
+            path,
+            display_path,
+            transferred,
+            total,
+            done,
+            error,
+        )
+        .await;
+    }
+}
+
+async fn write_remote_upload<R: tokio::io::AsyncRead + Unpin>(
+    raw: &Arc<RawSftpSession>,
+    handle: &str,
+    source: &mut R,
+    progress: &UploadProgress<'_>,
+    remote_path: &str,
+    display_path: &str,
+    total: Option<u64>,
+    transferred: &mut u64,
+    cancel: &TransferCancelToken,
+) -> Result<(), String> {
+    let mut writes = FuturesUnordered::new();
+    let mut offset = 0_u64;
+    let mut eof = false;
+    let mut last_emit = Instant::now();
+    let context = format!("Failed to write {remote_path}");
+    while !eof || !writes.is_empty() {
+        while !eof && writes.len() < SFTP_UPLOAD_WRITE_DEPTH {
+            let mut chunk = vec![0; SFTP_UPLOAD_CHUNK_SIZE];
+            let count = await_upload_operation(
+                cancel,
+                "Failed to read upload source",
+                source.read(&mut chunk),
+            )
+            .await?;
+            if count == 0 {
+                eof = true;
+                break;
+            }
+            chunk.truncate(count);
+            let request_offset = offset;
+            let handle = handle.to_string();
+            writes.push(async move {
+                raw.write(handle, request_offset, chunk)
+                    .await
+                    .map(|_| count)
+            });
+            offset += count as u64;
+        }
+        if !writes.is_empty() {
+            let count = await_upload_operation(cancel, &context, async {
+                writes.next().await.expect("write pipeline is nonempty")
+            })
+            .await?;
+            *transferred += count as u64;
+            if last_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
+                progress
+                    .emit(remote_path, display_path, *transferred, total, false, None)
+                    .await;
+                last_emit = Instant::now();
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn upload_from_reader<R: tokio::io::AsyncRead + Unpin>(
+    ssh_handle: &SharedSshHandle,
+    progress: &UploadProgress<'_>,
+    remote_path: &str,
+    display_path: &str,
+    mut source: R,
+    total: Option<u64>,
+    local_source: Option<(&Path, FileFingerprint)>,
+    cancel: &TransferCancelToken,
+) -> Result<(), String> {
+    progress
+        .emit(remote_path, display_path, 0, total, false, None)
+        .await;
+    let mut transferred = 0;
+    let result = async {
+        let (raw, version) = await_upload_operation(
+            cancel, "Failed to initialize SFTP upload session", create_raw_sftp_session(ssh_handle),
+        ).await?;
+        let mut original = remote_upload_destination(&raw, remote_path, cancel).await?;
+        let resolved_link = if original.as_ref().is_some_and(|attrs| attrs.is_symlink()) {
+            let target = resolve_upload_link(&raw, remote_path, cancel).await?;
+            original = remote_upload_destination(&raw, &target, cancel).await?;
+            if original.is_none() {
+                return Err(format!("Cannot upload through the dangling symlink {remote_path}"));
+            }
+            Some(target)
+        } else {
+            None
+        };
+        let destination = resolved_link.as_deref().unwrap_or(remote_path);
+        if let Some(metadata) = &original {
+            if !metadata.file_type().is_file() {
+                return Err(format!("Cannot replace {remote_path}: the destination must be a regular file"));
+            }
+            if version.extensions.get(POSIX_RENAME).map(String::as_str) != Some("1") {
+                return Err(format!("Cannot safely replace {remote_path}: this server does not support atomic replacement"));
+            }
+            let existing = await_upload_operation(
+                cancel, &format!("Cannot write to {remote_path}"),
+                raw.open(destination, OpenFlags::WRITE, FileAttributes::empty()),
+            ).await?;
+            await_upload_operation(cancel, "Failed to close existing upload destination", raw.close(existing.handle)).await?;
+        }
+
+        let name = transfer_staging_name()?;
+        let staging_path = match destination.rsplit_once('/') {
+            Some((parent, _)) => format!("{parent}/{name}"),
+            None => name,
+        };
+        let mut staging_attrs = FileAttributes::empty();
+        if original.is_some() {
+            staging_attrs.permissions = Some(0o600);
+        }
+        let handle = await_upload_operation(
+            cancel, &format!("Failed to create a temporary file for {remote_path}"),
+            raw.open(&staging_path, OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE, staging_attrs),
+        ).await?.handle;
+        let result = async {
+            write_remote_upload(&raw, &handle, &mut source, progress, remote_path, display_path, total, &mut transferred, cancel).await?;
+            if let Some((path, initial)) = &local_source {
+                if transferred != initial.len || file_fingerprint(path).await.as_ref() != Some(initial) {
+                    return Err(format!("{} changed during upload", path.display()));
+                }
+            }
+            if let Some(metadata) = &original {
+                let staged = await_upload_operation(cancel, "Failed to inspect temporary upload", raw.fstat(&handle)).await?.attrs;
+                let mut attributes = FileAttributes::empty();
+                attributes.permissions = metadata.permissions.map(|mode| mode & 0o777);
+                if (staged.uid, staged.gid) != (metadata.uid, metadata.gid) {
+                    attributes.uid = metadata.uid;
+                    attributes.gid = metadata.gid;
+                }
+                await_upload_operation(
+                    cancel, "Failed to preserve destination permissions or ownership",
+                    raw.setstat(&staging_path, attributes),
+                ).await?;
+            }
+            Ok::<_, String>(())
+        }.await;
+        let close_timeout = if result.is_ok() {
+            SFTP_UPLOAD_OPERATION_TIMEOUT
+        } else {
+            Duration::from_secs(2)
+        };
+        let close = tokio::time::timeout(close_timeout, raw.close(handle)).await;
+        let result = async {
+            result?;
+            close.map_err(|_| "Timed out closing temporary upload".to_string())?
+                .map_err(|e| format!("Failed to close temporary upload: {e}"))?;
+            if let Some(original) = &original {
+                let current = remote_upload_destination(&raw, destination, cancel).await?;
+                let fingerprint = |attrs: &FileAttributes| (attrs.size, attrs.mtime, attrs.permissions, attrs.uid, attrs.gid);
+                if current.as_ref().map(fingerprint) != Some(fingerprint(original)) {
+                    return Err(format!("Cannot replace {remote_path}: the destination changed during upload"));
+                }
+            }
+            if let Some(target) = &resolved_link {
+                if resolve_upload_link(&raw, remote_path, cancel).await? != *target {
+                    return Err(format!("Cannot replace {remote_path}: its symlink target changed during upload"));
+                }
+            }
+            if cancel.is_cancelled() {
+                return Err("Upload canceled".to_string());
+            }
+            tokio::time::timeout(
+                SFTP_UPLOAD_OPERATION_TIMEOUT,
+                commit_remote_upload(&raw, &staging_path, destination, original.is_some()),
+            ).await
+                .map_err(|_| format!("Could not confirm that {remote_path} was saved: the server timed out"))?
+                .map_err(|e| format!("Failed to save {remote_path}: {e}"))
+        }.await;
+        if result.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), raw.remove(&staging_path)).await;
+        }
+        result
+    }.await;
+    if progress.finalize || result.is_ok() {
+        progress
+            .emit(
+                remote_path,
+                display_path,
+                transferred,
+                total,
+                progress.finalize,
+                result.as_ref().err().cloned(),
+            )
+            .await;
+    }
+    result
+}
+
 async fn upload_local_file(
     ssh_handle: &SharedSshHandle,
-    app: &AppHandle,
-    id: &str,
-    session_id: i64,
+    progress: &UploadProgress<'_>,
     remote_path: &str,
     local_path: &Path,
-    queue_id: &str,
-    transfer_id: &str,
     display_path: &str,
     cancel: &TransferCancelToken,
 ) -> Result<(), String> {
-    let local_meta = fs::metadata(local_path)
+    let metadata = fs::metadata(local_path)
         .await
-        .map_err(|e| format!("Failed to inspect {}: {}", local_path.display(), e))?;
-    if cancel.is_cancelled() {
-        return Err("Transfer canceled".to_string());
+        .map_err(|e| format!("Failed to inspect {}: {e}", local_path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", local_path.display()));
     }
-    let total = Some(local_meta.len());
-
-    emit_transfer_progress(
-        app,
-        id,
-        session_id,
-        queue_id,
-        transfer_id,
-        "upload",
+    let local = fs::File::open(local_path)
+        .await
+        .map_err(|e| format!("Failed to open {}: {e}", local_path.display()))?;
+    let fingerprint = FileFingerprint {
+        len: metadata.len(),
+        modified_at: metadata.modified().ok(),
+    };
+    upload_from_reader(
+        ssh_handle,
+        progress,
         remote_path,
         display_path,
-        0,
-        total,
-        false,
-        None,
+        local,
+        Some(metadata.len()),
+        Some((local_path, fingerprint)),
+        cancel,
     )
-    .await;
-
-    let mut transferred = 0_u64;
-    let mut last_progress_emit = Instant::now();
-    let result: Result<(), String> = async {
-        let mut local = fs::File::open(local_path)
-            .await
-            .map_err(|e| format!("Failed to open {}: {}", local_path.display(), e))?;
-        let raw = await_upload_operation(
-            cancel,
-            "Failed to initialize SFTP upload session",
-            create_raw_sftp_session(ssh_handle),
-        )
-        .await?;
-        let handle = await_upload_operation(
-            cancel,
-            &format!("Failed to open {} for upload", remote_path),
-            raw.open(
-                remote_path,
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-                FileAttributes::empty(),
-            ),
-        )
-        .await?
-        .handle;
-
-        let upload_result: Result<(), String> = async {
-            let mut buffer = vec![0_u8; SFTP_UPLOAD_CHUNK_SIZE];
-            loop {
-                if cancel.is_cancelled() {
-                    return Err("Transfer canceled".to_string());
-                }
-                let count = local
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| format!("Failed to read {}: {}", local_path.display(), e))?;
-                if count == 0 {
-                    break;
-                }
-                await_upload_operation(
-                    cancel,
-                    &format!("Failed to write {}", remote_path),
-                    raw.write(handle.clone(), transferred, buffer[..count].to_vec()),
-                )
-                .await?;
-                transferred += count as u64;
-                if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
-                    emit_transfer_progress(
-                        app,
-                        id,
-                        session_id,
-                        queue_id,
-                        transfer_id,
-                        "upload",
-                        remote_path,
-                        display_path,
-                        transferred,
-                        total,
-                        false,
-                        None,
-                    )
-                    .await;
-                    last_progress_emit = Instant::now();
-                }
-            }
-
-            await_upload_operation(
-                cancel,
-                &format!("Failed to close {} after upload", remote_path),
-                raw.close(handle),
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-
-        let _ = raw.close_session();
-        upload_result
-    }
-    .await;
-
-    match result {
-        Ok(()) => {
-            emit_transfer_progress(
-                app,
-                id,
-                session_id,
-                queue_id,
-                transfer_id,
-                "upload",
-                remote_path,
-                display_path,
-                transferred,
-                total,
-                true,
-                None,
-            )
-            .await;
-            Ok(())
-        }
-        Err(error) => {
-            emit_transfer_error(
-                app,
-                id,
-                session_id,
-                queue_id,
-                transfer_id,
-                "upload",
-                remote_path,
-                display_path,
-                transferred,
-                total,
-                &error,
-            )
-            .await;
-            Err(error)
-        }
-    }
+    .await
 }
 
 struct BatchDownloadProgress<'a> {
@@ -1189,16 +1420,22 @@ impl<'a> BatchDownloadProgress<'a> {
         self.last_emit = Instant::now();
     }
 
-    async fn maybe_emit(&mut self, path: &str, display_path: &str, transferred: u64, total: u64) {
+    async fn maybe_emit(
+        &mut self,
+        path: &str,
+        display_path: &str,
+        transferred: u64,
+        total: Option<u64>,
+    ) {
         if self.last_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
-            self.emit(path, display_path, transferred, Some(total), false, None)
+            self.emit(path, display_path, transferred, total, false, None)
                 .await;
         }
     }
 
     fn batch_complete_display(&self) -> String {
         if self.total_files == 0 {
-            "No files".to_string()
+            "Download complete".to_string()
         } else if self.total_files == 1 {
             "1 file downloaded".to_string()
         } else {
@@ -1213,30 +1450,38 @@ async fn download_remote_file_in_batch(
     progress: &mut BatchDownloadProgress<'_>,
     remote_path: &str,
     local_path: &Path,
+    listed_metadata: Option<FileAttributes>,
     cancel: &TransferCancelToken,
 ) -> Result<(), String> {
     ensure_local_parent(local_path).await?;
-    progress.total_files = progress.total_files.saturating_add(1);
     let display_name = remote_display_name(remote_path);
     if cancel.is_cancelled() {
         return Err("Download canceled".to_string());
     }
-    let file_size = sftp
-        .metadata(remote_path)
-        .await
-        .map_err(|e| format!("Failed to inspect {}: {}", remote_path, e))?
-        .len();
+    let metadata = match listed_metadata {
+        Some(metadata) => metadata,
+        None => {
+            await_download_operation(
+                cancel,
+                &format!("Failed to inspect {remote_path}"),
+                sftp.metadata(remote_path),
+            )
+            .await?
+        }
+    };
+    if metadata.file_type().is_dir() {
+        return Err("Cannot download a directory link inside a folder".to_string());
+    }
+    let total = metadata.size;
+    let file_size = metadata.len();
 
     progress
-        .emit(remote_path, &display_name, 0, Some(file_size), false, None)
+        .emit(remote_path, &display_name, 0, total, false, None)
         .await;
 
+    let (mut local, staging_path) = create_local_download(local_path).await?;
+    let mut file_transferred = 0_u64;
     let result: Result<(), String> = async {
-        let mut local = fs::File::create(local_path)
-            .await
-            .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
-
-        let mut file_transferred = 0_u64;
         if file_size >= PIPELINED_DOWNLOAD_MIN_SIZE {
             download_remote_file_pipelined(
                 ssh_handle,
@@ -1256,19 +1501,23 @@ async fn download_remote_file_in_batch(
             )
             .await?;
         } else {
-            let mut remote = sftp
-                .open(remote_path)
-                .await
-                .map_err(|e| format!("Failed to open {}: {}", remote_path, e))?;
+            let mut remote = await_download_operation(
+                cancel,
+                &format!("Failed to open {remote_path}"),
+                sftp.open(remote_path),
+            )
+            .await?;
             let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
             loop {
                 if cancel.is_cancelled() {
                     return Err("Download canceled".to_string());
                 }
-                let count = remote
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| format!("Failed to read {}: {}", remote_path, e))?;
+                let count = tokio::select! {
+                    _ = cancel.cancelled() => return Err("Download canceled".to_string()),
+                    read = remote.read(&mut buffer) => {
+                        read.map_err(|e| format!("Failed to read {}: {}", remote_path, e))?
+                    },
+                };
                 if count == 0 {
                     break;
                 }
@@ -1279,33 +1528,23 @@ async fn download_remote_file_in_batch(
                     .map_err(|e| format!("Failed to write {}: {}", local_path.display(), e))?;
                 file_transferred = file_transferred.saturating_add(count as u64);
                 progress
-                    .maybe_emit(remote_path, &display_name, file_transferred, file_size)
+                    .maybe_emit(remote_path, &display_name, file_transferred, total)
                     .await;
             }
         }
 
-        local
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush {}: {}", local_path.display(), e))?;
+        if total.is_some_and(|size| size != file_transferred) {
+            return Err(format!("{remote_path} changed size during download"));
+        }
         Ok(())
     }
     .await;
 
-    if let Err(error) = result {
-        let _ = fs::remove_file(local_path).await;
-        return Err(error);
-    }
+    finish_local_download(local, &staging_path, local_path, result, cancel).await?;
+    progress.total_files = progress.total_files.saturating_add(1);
 
     progress
-        .emit(
-            remote_path,
-            &display_name,
-            file_size,
-            Some(file_size),
-            false,
-            None,
-        )
+        .maybe_emit(remote_path, &display_name, file_transferred, total)
         .await;
 
     Ok(())
@@ -1317,6 +1556,7 @@ async fn download_remote_tree_streaming(
     progress: &mut BatchDownloadProgress<'_>,
     remote_path: &str,
     local_path: &Path,
+    listed_metadata: Option<FileAttributes>,
     failures: &mut Vec<String>,
     cancel: &TransferCancelToken,
 ) -> Result<(), String> {
@@ -1324,12 +1564,22 @@ async fn download_remote_tree_streaming(
         return Err("Download canceled".to_string());
     }
 
-    let metadata = match sftp.metadata(remote_path).await {
-        Ok(m) => m,
-        Err(e) => {
-            failures.push(format!("{} ({})", remote_path, e));
-            return Ok(());
-        }
+    let metadata = match listed_metadata {
+        Some(metadata) => metadata,
+        None => match await_download_operation(
+            cancel,
+            "Failed to inspect item",
+            sftp.metadata(remote_path),
+        )
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(_) if cancel.is_cancelled() => return Err("Download canceled".to_string()),
+            Err(error) => {
+                failures.push(format!("{remote_path} ({error})"));
+                return Ok(());
+            }
+        },
     };
 
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -1339,6 +1589,7 @@ async fn download_remote_tree_streaming(
             progress,
             remote_path,
             local_path,
+            Some(metadata),
             cancel,
         )
         .await
@@ -1360,42 +1611,31 @@ async fn download_remote_tree_streaming(
         return Ok(());
     }
 
-    let entries = match sftp.read_dir(remote_path).await {
+    let folder_name = remote_display_name(remote_path);
+    progress
+        .emit(
+            remote_path,
+            &format!("scanning {folder_name}"),
+            0,
+            None,
+            false,
+            None,
+        )
+        .await;
+    let entries = match await_download_operation(
+        cancel,
+        "Failed to list directory",
+        sftp.read_dir(remote_path),
+    )
+    .await
+    {
         Ok(e) => e,
+        Err(_) if cancel.is_cancelled() => return Err("Download canceled".to_string()),
         Err(e) => {
             failures.push(format!("{} ({})", remote_path, e));
             return Ok(());
         }
     };
-    let entries = entries
-        .into_iter()
-        .filter(|entry| {
-            let name = entry.file_name();
-            name != "." && name != ".."
-        })
-        .collect::<Vec<_>>();
-    let folder_name = remote_display_name(remote_path);
-    let total_entries = entries.len() as u64;
-    let mut completed_entries = 0_u64;
-
-    progress
-        .emit(
-            remote_path,
-            &folder_name,
-            0,
-            Some(total_entries),
-            false,
-            None,
-        )
-        .await;
-
-    if total_entries == 0 {
-        progress
-            .emit(remote_path, &folder_name, 0, Some(0), false, None)
-            .await;
-        return Ok(());
-    }
-
     let mut local_names = HashSet::new();
     for entry in entries {
         if cancel.is_cancelled() {
@@ -1403,23 +1643,15 @@ async fn download_remote_tree_streaming(
         }
 
         let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
         let local_name = sanitize_local_name(&name);
         if !local_names.insert(local_name_collision_key(&local_name)) {
             failures.push(format!(
                 "{} (local filename collides with another item after sanitization)",
                 entry.path()
             ));
-            completed_entries = completed_entries.saturating_add(1);
-            progress
-                .emit(
-                    remote_path,
-                    &folder_name,
-                    completed_entries,
-                    Some(total_entries),
-                    false,
-                    None,
-                )
-                .await;
             continue;
         }
         let child_local_path = local_path.join(local_name);
@@ -1433,6 +1665,7 @@ async fn download_remote_tree_streaming(
                 progress,
                 &child_remote_path,
                 &child_local_path,
+                Some(entry.metadata()),
                 failures,
                 cancel,
             ))
@@ -1443,6 +1676,7 @@ async fn download_remote_tree_streaming(
             progress,
             &child_remote_path,
             &child_local_path,
+            (!child_file_type.is_symlink()).then(|| entry.metadata()),
             cancel,
         )
         .await
@@ -1452,18 +1686,6 @@ async fn download_remote_tree_streaming(
             }
             failures.push(format!("{} ({})", child_remote_path, error));
         }
-
-        completed_entries = completed_entries.saturating_add(1);
-        progress
-            .emit(
-                remote_path,
-                &folder_name,
-                completed_entries,
-                Some(total_entries),
-                false,
-                None,
-            )
-            .await;
     }
 
     Ok(())
@@ -1487,11 +1709,11 @@ fn spawn_edit_watcher(
     session_id: i64,
     remote_path: String,
     local_path: PathBuf,
+    mut last_uploaded: Option<FileFingerprint>,
     generation: u64,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let mut last_uploaded = file_fingerprint(&local_path).await;
         let mut pending: Option<(FileFingerprint, Instant)> = None;
         let mut last_failed: Option<FileFingerprint> = None;
 
@@ -1561,6 +1783,10 @@ fn spawn_edit_watcher(
                     last_failed = None;
                     pending = None;
                 }
+                Err(error) if error == "Transfer canceled" || error == "Upload canceled" => {
+                    last_failed = Some(current);
+                    pending = None;
+                }
                 Err(error) => {
                     emit_edit_upload_error(
                         &app,
@@ -1602,45 +1828,50 @@ pub async fn sftp_list_dir(
                     .await
                     .map_err(|e| format!("Failed to resolve directory {}: {}", path, e))?
             };
-        let mut entries = Vec::new();
         let dir_entries = sftp
             .read_dir(&canonical_path)
             .await
             .map_err(|e| format!("Failed to read directory {}: {}", canonical_path, e))?;
 
-        for entry in dir_entries {
+        let mut entries = futures::stream::iter(dir_entries.into_iter().filter_map(|entry| {
             let name = entry.file_name();
-            if name == "." || name == ".." {
-                continue;
+            (name != "." && name != "..").then_some((name, entry))
+        }))
+        .map(|(name, entry)| {
+            let sftp = &sftp;
+            async move {
+                let metadata = entry.metadata();
+                let file_type = entry.file_type();
+                let path = entry.path();
+                let is_symlink = file_type.is_symlink();
+                let is_dir = file_type.is_dir()
+                    || (is_symlink
+                        && sftp
+                            .metadata(&path)
+                            .await
+                            .map(|target_metadata| target_metadata.file_type().is_dir())
+                            .unwrap_or(false));
+                FileEntry {
+                    path,
+                    name,
+                    is_dir,
+                    is_symlink,
+                    size: metadata.size,
+                    modified: metadata.modified().ok().and_then(|time| {
+                        time.duration_since(UNIX_EPOCH)
+                            .ok()
+                            .map(|duration| duration.as_secs())
+                    }),
+                }
             }
+        })
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
 
-            let metadata = entry.metadata();
-            let file_type = entry.file_type();
-            let path = entry.path();
-            let is_symlink = file_type.is_symlink();
-            let is_dir = file_type.is_dir()
-                || (is_symlink
-                    && sftp
-                        .metadata(&path)
-                        .await
-                        .map(|target_metadata| target_metadata.file_type().is_dir())
-                        .unwrap_or(false));
-
-            entries.push(FileEntry {
-                path,
-                name,
-                is_dir,
-                is_symlink,
-                size: metadata.size,
-                modified: metadata.modified().ok().and_then(|time| {
-                    time.duration_since(UNIX_EPOCH)
-                        .ok()
-                        .map(|duration| duration.as_secs())
-                }),
-            });
-        }
-
-        entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+        entries.sort_by_cached_key(|entry| {
+            (!entry.is_dir, entry.name.to_lowercase(), entry.name.clone())
+        });
 
         Ok(DirectoryListing {
             path: canonical_path,
@@ -1725,7 +1956,7 @@ pub async fn sftp_download_selection(
             };
 
             progress
-                .emit("", "Starting download...", 0, Some(1), false, None)
+                .emit("", "preparing files", 0, None, false, None)
                 .await;
 
             for remote_path in &normalized_paths {
@@ -1736,20 +1967,14 @@ pub async fn sftp_download_selection(
                     &mut progress,
                     remote_path,
                     &local_path,
+                    None,
                     &mut failures,
                     &cancel,
                 )
                 .await
                 {
                     progress
-                        .emit(
-                            "",
-                            "Download canceled",
-                            1,
-                            Some(1),
-                            true,
-                            Some(error.clone()),
-                        )
+                        .emit("", "Download canceled", 0, None, true, Some(error.clone()))
                         .await;
                     return Err(error);
                 }
@@ -1761,8 +1986,8 @@ pub async fn sftp_download_selection(
                 .emit(
                     "",
                     &display_path,
-                    1,
-                    Some(1),
+                    0,
+                    None,
                     true,
                     if failures.is_empty() {
                         None
@@ -1795,9 +2020,8 @@ pub async fn sftp_edit(
 ) -> Result<String, String> {
     let remote_path = normalize_remote_path(&remote_path);
     let session_id = session_id_for_terminal(state.inner(), &id)?;
-    let local_path = local_download_path(&id, &remote_path);
+    let local_path = local_download_path(&id, &remote_path)?;
 
-    edit_state.stop_watcher(&id, &remote_path)?;
     let local_path_string = sftp_download_impl(
         &app,
         state.inner(),
@@ -1809,29 +2033,25 @@ pub async fn sftp_edit(
     )
     .await?;
 
-    let (generation, stop_rx) = edit_state.replace_watcher(&id, &remote_path)?;
-    spawn_edit_watcher(
-        app.clone(),
-        id.clone(),
-        session_id,
-        remote_path.clone(),
-        local_path.clone(),
-        generation,
-        stop_rx,
-    );
-
-    let open_result = app
-        .opener()
+    let fingerprint = file_fingerprint(&local_path).await;
+    app.opener()
         .open_path(
             &local_path_string,
             with.as_deref().filter(|value| !value.is_empty()),
         )
-        .map_err(|e| e.to_string());
+        .map_err(|e| e.to_string())?;
 
-    if let Err(error) = open_result {
-        edit_state.stop_watcher(&id, &remote_path)?;
-        return Err(error);
-    }
+    let (generation, stop_rx) = edit_state.replace_watcher(&id, &remote_path)?;
+    spawn_edit_watcher(
+        app,
+        id,
+        session_id,
+        remote_path,
+        local_path,
+        fingerprint,
+        generation,
+        stop_rx,
+    );
 
     Ok(local_path_string)
 }
@@ -1909,55 +2129,62 @@ pub async fn sftp_upload_selection(
         }
     }
 
-    let lookup_id = id.clone();
-    let session_lookup_id = lookup_id.clone();
+    let ssh_handle = upload_ssh_handle(state.inner(), &id)?;
     let queue_id = queue_id("upload-batch", session_id);
     let cancel = transfer_state.register_queue(&id, &queue_id)?;
-    let finish_queue_id = queue_id.clone();
-    let result = with_sftp_session(
-        state.inner(),
-        &session_lookup_id,
-        move |_, ssh_handle| async move {
-            let mut failures = Vec::new();
+    let progress = UploadProgress {
+        app: &app,
+        id: &id,
+        session_id,
+        queue_id: &queue_id,
+        transfer_id: &queue_id,
+        finalize: false,
+    };
+    let mut uploaded = 0;
+    progress
+        .emit("", "Preparing files", 0, None, false, None)
+        .await;
+    let result = async {
+        let mut failures = Vec::new();
 
-            for entry in &normalized {
-                if cancel.is_cancelled() {
+        for entry in &normalized {
+            if cancel.is_cancelled() {
+                return Err("Upload canceled".to_string());
+            }
+            let local_path = PathBuf::from(&entry.local_path);
+            let display_path = remote_display_name(&entry.remote_path);
+
+            if let Err(error) = upload_local_file(
+                &ssh_handle,
+                &progress,
+                &entry.remote_path,
+                &local_path,
+                &display_path,
+                &cancel,
+            )
+            .await
+            {
+                if error == "Upload canceled" || error == "Transfer canceled" {
                     return Err("Upload canceled".to_string());
                 }
-                let local_path = PathBuf::from(&entry.local_path);
-                let transfer_id = transfer_id_for_path("upload", &entry.remote_path);
-                let display_path = remote_display_name(&entry.remote_path);
-
-                if let Err(error) = upload_local_file(
-                    &ssh_handle,
-                    &app,
-                    &lookup_id,
-                    session_id,
-                    &entry.remote_path,
-                    &local_path,
-                    &queue_id,
-                    &transfer_id,
-                    &display_path,
-                    &cancel,
-                )
-                .await
-                {
-                    if error == "Upload canceled" || error == "Transfer canceled" {
-                        return Err("Upload canceled".to_string());
-                    }
-                    failures.push(format!("{} ({})", entry.local_path, error));
-                }
-            }
-
-            if failures.is_empty() {
-                Ok(())
+                failures.push(format!("{} ({})", entry.local_path, error));
             } else {
-                Err(format_batch_upload_error(&failures))
+                uploaded += 1;
             }
-        },
-    )
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format_batch_upload_error(&failures))
+        }
+    }
     .await;
-    transfer_state.finish_queue(&id, &finish_queue_id)?;
+    let summary = format!("{uploaded} of {} files uploaded", normalized.len());
+    progress
+        .emit("", &summary, 0, None, true, result.as_ref().err().cloned())
+        .await;
+    transfer_state.finish_queue(&id, &queue_id)?;
     result
 }
 
@@ -1972,119 +2199,31 @@ pub async fn sftp_upload_bytes(
 ) -> Result<(), String> {
     let remote_path = normalize_remote_path(&remote_path);
     let session_id = session_id_for_terminal(state.inner(), &id)?;
+    let ssh_handle = upload_ssh_handle(state.inner(), &id)?;
     let total = Some(data.len() as u64);
-
-    let lookup_id = id.clone();
-    let task_id = id.clone();
     let queue_id = queue_id("upload-bytes", session_id);
     let cancel = transfer_state.register_queue(&id, &queue_id)?;
-    let finish_queue_id = queue_id.clone();
     let transfer_id = transfer_id_for_path("upload", &remote_path);
-    let display_path = remote_path.clone();
-    let result = with_sftp_session(state.inner(), &lookup_id, move |sftp, _| async move {
-        emit_transfer_progress(
-            &app,
-            &task_id,
-            session_id,
-            &queue_id,
-            &transfer_id,
-            "upload",
-            &remote_path,
-            &display_path,
-            0,
-            total,
-            false,
-            None,
-        )
-        .await;
-
-        let mut transferred = 0_u64;
-        let mut last_progress_emit = Instant::now();
-        let result: Result<(), String> = async {
-            let mut remote = sftp
-                .open_with_flags(
-                    &remote_path,
-                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE | OpenFlags::READ,
-                )
-                .await
-                .map_err(|e| format!("Failed to open {} for upload: {}", remote_path, e))?;
-
-            for chunk in data.chunks(TRANSFER_BUFFER_SIZE) {
-                if cancel.is_cancelled() {
-                    return Err("Upload canceled".to_string());
-                }
-                remote
-                    .write_all(chunk)
-                    .await
-                    .map_err(|e| format!("Failed to write {}: {}", remote_path, e))?;
-                transferred += chunk.len() as u64;
-                if last_progress_emit.elapsed() >= TRANSFER_PROGRESS_EMIT_INTERVAL {
-                    emit_transfer_progress(
-                        &app,
-                        &task_id,
-                        session_id,
-                        &queue_id,
-                        &transfer_id,
-                        "upload",
-                        &remote_path,
-                        &display_path,
-                        transferred,
-                        total,
-                        false,
-                        None,
-                    )
-                    .await;
-                    last_progress_emit = Instant::now();
-                }
-            }
-            remote
-                .flush()
-                .await
-                .map_err(|e| format!("Failed to flush {}: {}", remote_path, e))?;
-            Ok(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                emit_transfer_progress(
-                    &app,
-                    &task_id,
-                    session_id,
-                    &queue_id,
-                    &transfer_id,
-                    "upload",
-                    &remote_path,
-                    &display_path,
-                    transferred,
-                    total,
-                    true,
-                    None,
-                )
-                .await;
-                Ok(())
-            }
-            Err(error) => {
-                emit_transfer_error(
-                    &app,
-                    &task_id,
-                    session_id,
-                    &queue_id,
-                    &transfer_id,
-                    "upload",
-                    &remote_path,
-                    &display_path,
-                    transferred,
-                    total,
-                    &error,
-                )
-                .await;
-                Err(error)
-            }
-        }
-    })
+    let progress = UploadProgress {
+        app: &app,
+        id: &id,
+        session_id,
+        queue_id: &queue_id,
+        transfer_id: &transfer_id,
+        finalize: true,
+    };
+    let result = upload_from_reader(
+        &ssh_handle,
+        &progress,
+        &remote_path,
+        &remote_path,
+        std::io::Cursor::new(data),
+        total,
+        None,
+        &cancel,
+    )
     .await;
-    transfer_state.finish_queue(&id, &finish_queue_id)?;
+    transfer_state.finish_queue(&id, &queue_id)?;
     result
 }
 
@@ -2189,7 +2328,8 @@ async fn exec_ssh_command(handle: &SharedSshHandle, command: &str) -> Result<(),
     }
 
     match exit_status {
-        Some(0) | None => Ok(()),
+        Some(0) => Ok(()),
+        None => Err("SSH closed before confirming the result of the delete".to_string()),
         Some(code) => {
             let msg = if stderr_output.trim().is_empty() {
                 format!("Command exited with code {}", code)
@@ -2317,10 +2457,10 @@ pub async fn sftp_delete_selection(
                         .map_err(|e| format!("Failed to delete file {}: {}", entry.path, e))
                 };
 
-                if let Err(error) = result {
-                    failures.push(error);
+                match result {
+                    Ok(()) => progress.tick().await,
+                    Err(error) => failures.push(format!("{} ({error})", entry.path)),
                 }
-                progress.tick().await;
             }
 
             if failures.is_empty() {
@@ -2361,6 +2501,104 @@ pub fn cancel_sftp_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn download_publishes_only_a_successful_copy() {
+        let directory = std::env::temp_dir().join(transfer_staging_name().unwrap());
+        fs::create_dir(&directory).await.unwrap();
+        let destination = directory.join("existing.txt");
+        fs::write(&destination, b"original").await.unwrap();
+
+        let (mut staged_file, staging_path) = create_local_download(&destination).await.unwrap();
+        staged_file.write_all(b"partial").await.unwrap();
+        let cancel = TransferCancelToken::new();
+        cancel.cancel();
+        let result =
+            finish_local_download(staged_file, &staging_path, &destination, Ok(()), &cancel).await;
+        assert_eq!(result.unwrap_err(), "Download canceled");
+        assert_eq!(fs::read(&destination).await.unwrap(), b"original");
+        assert!(!staging_path.exists());
+
+        let (mut staged_file, staging_path) = create_local_download(&destination).await.unwrap();
+        staged_file.write_all(b"failed").await.unwrap();
+        let cancel = TransferCancelToken::new();
+        let result = finish_local_download(
+            staged_file,
+            &staging_path,
+            &destination,
+            Err("read failed".to_string()),
+            &cancel,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "read failed");
+        assert_eq!(fs::read(&destination).await.unwrap(), b"original");
+        assert!(!staging_path.exists());
+
+        let (mut staged_file, staging_path) = create_local_download(&destination).await.unwrap();
+        staged_file.write_all(b"complete").await.unwrap();
+        finish_local_download(staged_file, &staging_path, &destination, Ok(()), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&destination).await.unwrap(), b"complete");
+        assert!(!staging_path.exists());
+
+        fs::remove_file(destination).await.unwrap();
+        fs::remove_dir(directory).await.unwrap();
+    }
+
+    #[test]
+    fn remote_paths_and_edit_copies_keep_distinct_file_identities() {
+        assert_eq!(normalize_remote_path(r"/first\second"), r"/first\second");
+        let first = local_download_path("terminal", "/dir/a:b").unwrap();
+        let second = local_download_path("terminal", "/dir/a?b").unwrap();
+        let reopened = local_download_path("terminal", "/dir/a:b").unwrap();
+        assert_eq!(first.file_name(), second.file_name());
+        assert_ne!(first, second);
+        assert_ne!(first, reopened);
+    }
+
+    #[tokio::test]
+    async fn replacement_uses_the_atomic_rename_protocol() {
+        use russh_sftp::{protocol::Status, server::Handler};
+
+        struct RenameServer;
+
+        impl Handler for RenameServer {
+            type Error = StatusCode;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported
+            }
+
+            async fn extended(
+                &mut self,
+                id: u32,
+                request: String,
+                data: Vec<u8>,
+            ) -> Result<Packet, Self::Error> {
+                assert_eq!(request, POSIX_RENAME);
+                assert_eq!(data, b"\0\0\0\x05a.tmp\0\0\0\x05a.txt");
+                Ok(Packet::Status(Status {
+                    id,
+                    status_code: StatusCode::Ok,
+                    error_message: String::new(),
+                    language_tag: String::new(),
+                }))
+            }
+        }
+
+        let (client, server) = tokio::io::duplex(4096);
+        russh_sftp::server::run(server, RenameServer).await;
+        let raw = RawSftpSession::new_with_config(client, sftp_config());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            raw.init().await.unwrap();
+            commit_remote_upload(&raw, "a.tmp", "a.txt", true)
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn pending_upload_operation_stops_when_cancelled() {

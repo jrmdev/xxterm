@@ -1,5 +1,7 @@
 import { createEffect, lazy, onCleanup, onMount, Show, Suspense } from "solid-js";
+import { listen } from "@tauri-apps/api/event";
 import { sessions, portForwards } from "./stores/sessions";
+import { refreshPortForwardStatus, refreshSidebarPortForwardStatus } from "./stores/portForwards";
 import { settings } from "./stores/settings";
 import { dismissEditUploadError, ensureSftpEventListeners, fileBrowser } from "./stores/fileBrowser";
 import TerminalPane from "./components/TerminalPane";
@@ -34,6 +36,18 @@ function App() {
 
   onMount(() => {
     void Promise.all([ensureSftpEventListeners(), loadSettings()]);
+    const forwardListener = listen<number>("port-forward-status-changed", ({ payload: sessionId }) => {
+      if (portForwards.sessionId === sessionId) {
+        void refreshPortForwardStatus(sessionId);
+      }
+      const session = sessions.list.find((item) => item.id === sessionId);
+      if (session && portForwards.sidebarList.some((forward) => forward.session_id === sessionId)) {
+        void refreshSidebarPortForwardStatus([session]);
+      }
+    }).catch((error) => {
+      console.error("Failed to listen for port forward status:", error);
+    });
+    onCleanup(() => void forwardListener.then((unlisten) => unlisten?.()));
     document.addEventListener("keydown", preventWebviewShortcutDefaults);
     onCleanup(() => document.removeEventListener("keydown", preventWebviewShortcutDefaults));
   });
@@ -110,6 +124,9 @@ function App() {
             </div>
             <div style={{ color: "var(--form-text)", "font-size": "12px", "line-height": "1.5", "margin-bottom": "8px" }}>
               Could not re-upload <code style={{ "font-family": "var(--form-mono)" }}>{fileBrowser.editUploadError?.remotePath}</code>.
+            </div>
+            <div style={{ color: "var(--form-text)", "font-size": "12px", "line-height": "1.5", "margin-bottom": "8px", "overflow-wrap": "anywhere" }}>
+              Your local copy is at <code style={{ "font-family": "var(--form-mono)" }}>{fileBrowser.editUploadError?.localPath}</code>.
             </div>
             <div class="form-error" style={{ "margin-bottom": "16px" }}>{fileBrowser.editUploadError?.error}</div>
             <div style={{ display: "flex", "justify-content": "flex-end" }}>

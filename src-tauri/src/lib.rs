@@ -1,3 +1,5 @@
+#[cfg(windows)]
+mod admin_terminal;
 mod commands;
 mod crypto;
 mod port_forward;
@@ -21,7 +23,36 @@ pub fn run() {
     std::env::set_var("MESA_DEBUG", "silent");
     env_logger::init();
 
-    tauri::Builder::default()
+    #[cfg(windows)]
+    let admin_terminal = admin_terminal::AdminTerminalState::new();
+    #[cfg(windows)]
+    let elevated = admin_terminal.elevated;
+    #[cfg(not(windows))]
+    let elevated = false;
+
+    let mut context = tauri::generate_context!();
+    let suffix = if elevated { " (Administrator)" } else { "" };
+    let title = format!("xxterm {}{suffix}", context.package_info().version);
+    if let Some(window) = context
+        .config_mut()
+        .app
+        .windows
+        .iter_mut()
+        .find(|window| window.label == "main")
+    {
+        window.title = title;
+        #[cfg(windows)]
+        if admin_terminal.startup_shell.is_some() {
+            // Keep normal and elevated windows in different WebView2 process groups.
+            window.data_directory = Some("jrmdev.xxterm-administrator".into());
+            window.devtools = Some(false);
+        }
+    }
+
+    let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.manage(admin_terminal);
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(PtyState::new())
@@ -31,15 +62,15 @@ pub fn run() {
         .manage(SftpEditState::new())
         .manage(SftpTransferState::new())
         .setup(|app| {
-            let version = app.package_info().version.to_string();
-            if let Some(window) = app.get_webview_window("main") {
-                window.set_title(&format!("xxterm {version}"))?;
-            }
             let store = SessionStore::new()?;
             app.manage(store);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            #[cfg(windows)]
+            admin_terminal::get_startup_admin_terminal,
+            #[cfg(windows)]
+            admin_terminal::open_admin_terminal,
             pty::create_pty,
             pty::write_pty,
             pty::resize_pty,
@@ -102,6 +133,6 @@ pub fn run() {
             port_forward::get_port_forward_status,
             commands::check_program,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

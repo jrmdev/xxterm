@@ -340,6 +340,66 @@ html, body, #root {
   animation: sftp-spin 900ms linear infinite;
 }
 
+.sftp-activity {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 8px;
+  max-height: 45%;
+  overflow: auto;
+  padding: 8px;
+  background: var(--app-surface);
+  border-top: 1px solid var(--app-border);
+}
+
+.sftp-activity__summary,
+.sftp-activity__progress,
+.sftp-activity-error {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sftp-activity__summary {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.sftp-activity__summary > :first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sftp-activity__progress {
+  align-items: center;
+  margin-top: 4px;
+}
+
+.sftp-activity__track {
+  flex: 1;
+  height: 4px;
+  overflow: hidden;
+  background: var(--app-progress-track);
+  border-radius: 999px;
+}
+
+.sftp-activity__summary--error,
+.sftp-activity-error {
+  color: var(--app-danger);
+}
+
+.sftp-activity-error {
+  align-items: flex-start;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.sftp-activity-error > button {
+  flex-shrink: 0;
+}
+
 .sftp-progress-fill {
   height: 100%;
   transition: width 0.15s ease;

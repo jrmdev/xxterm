@@ -1,8 +1,11 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { open } from "@tauri-apps/plugin-dialog";
+import { sep } from "@tauri-apps/api/path";
 import {
   cancelActiveSftpQueue,
   clearSftpViewError,
+  dismissSftpDelete,
+  dismissSftpTransfer,
   fileBrowser,
   getActiveSftpView,
   getDeleteProgressForTerminal,
@@ -53,9 +56,14 @@ function formatTransferSpeed(value: number | null) {
   return `${(value / (1000 * 1000 * 1000)).toFixed(1)}\u00A0GB/s`;
 }
 
+const modifiedDateFormatter = new Intl.DateTimeFormat(undefined, {
+  year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+});
+
 function formatModified(value: number | null) {
   if (!value) return "";
-  return new Date(value * 1000).toLocaleString(undefined, { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+  const date = new Date(value * 1000);
+  return Number.isNaN(date.getTime()) ? date.toLocaleString() : modifiedDateFormatter.format(date);
 }
 
 function isHiddenEntry(entry: RemoteFileEntry) {
@@ -106,7 +114,7 @@ function entryIcon(entry: RemoteFileEntry) {
 }
 
 function localBaseName(path: string) {
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  return path.split(sep() === "\\" ? /[\\/]/ : "/").filter(Boolean).pop() ?? path;
 }
 
 function formatErrorMessage(error: unknown, fallback: string) {
@@ -132,15 +140,18 @@ function orderedSelection(paths: string[], selected: Set<string>) {
   return paths.filter((path) => selected.has(path));
 }
 
+const listingRowHeight = 44;
+const listingOverscan = 8;
+
 export default function FileBrowser() {
   let retryTimer: number | undefined;
-  let errorOverlayTimer: number | undefined;
   let typeaheadResetTimer: number | undefined;
   let listingRef: HTMLDivElement | undefined;
-  const entryRefs = new Map<string, HTMLDivElement>();
+  let scrollRef: HTMLDivElement | undefined;
+  const [scrollTop, setScrollTop] = createSignal(0);
+  const [viewportHeight, setViewportHeight] = createSignal(0);
   const [busyPath, setBusyPath] = createSignal<string | null>(null);
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number; entry: RemoteFileEntry | null } | null>(null);
-  const [visibleError, setVisibleError] = createSignal("");
   const [renameDialog, setRenameDialog] = createSignal<{ entry: RemoteFileEntry; name: string } | null>(null);
   let renameInputRef: HTMLInputElement | undefined;
   const [newFolderDialog, setNewFolderDialog] = createSignal<string | null>(null);
@@ -152,15 +163,24 @@ export default function FileBrowser() {
     const entries = activeView().entries;
     return fileBrowser.showHiddenFiles ? entries : entries.filter((entry) => !isHiddenEntry(entry));
   });
+  const clampedScrollTop = createMemo(() => Math.max(0, Math.min(
+    scrollTop(), visibleEntries().length * listingRowHeight - viewportHeight(),
+  )));
+  const firstRow = createMemo(() => Math.max(0, Math.floor(clampedScrollTop() / listingRowHeight) - listingOverscan));
+  const endRow = createMemo(() => Math.min(
+    visibleEntries().length, Math.ceil((clampedScrollTop() + viewportHeight()) / listingRowHeight) + listingOverscan,
+  ));
+  const renderedEntries = createMemo(() => visibleEntries().slice(firstRow(), endRow()));
   const selectedPathSet = createMemo(() => new Set(activeView().selectedPaths));
-  const selectedEntries = createMemo(() => {
+  const selectedEntries = () => {
     const selected = selectedPathSet();
     return activeView().entries.filter((entry) => selected.has(entry.path));
-  });
+  };
   const contextMenuEntries = createMemo(() => {
     const menu = contextMenu();
+    if (!menu) return [];
     const entries = selectedEntries();
-    if (!menu?.entry) return entries;
+    if (!menu.entry) return entries;
     if (entries.some((entry) => entry.path === menu.entry!.path)) {
       return entries;
     }
@@ -169,12 +189,25 @@ export default function FileBrowser() {
   const contextMenuSingleEntry = createMemo(() => (contextMenuEntries().length === 1 ? contextMenuEntries()[0] : null));
   const [pathInput, setPathInput] = createSignal(activeView().currentPath);
 
-  createEffect(() => {
-    const activeTerminalId = terminalId();
-    const sessionId = activeView().sessionId;
-    if (fileBrowser.activePane !== "sftp" || !activeTerminalId || !sessionId) return;
-    void loadRemoteDirectory(activeTerminalId);
+  onMount(() => {
+    const viewport = scrollRef;
+    if (!viewport) return;
+    const updateViewport = () => setViewportHeight(viewport.clientHeight);
+    updateViewport();
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(viewport);
+    onCleanup(() => observer.disconnect());
   });
+
+  createEffect(on([terminalId, () => activeView().currentPath], () => {
+    if (scrollRef) scrollRef.scrollTop = 0;
+    setScrollTop(0);
+  }));
+
+  createEffect(on([terminalId, () => activeView().sessionId, () => fileBrowser.activePane], ([activeTerminalId, sessionId, pane]) => {
+    if (pane !== "sftp" || !activeTerminalId || !sessionId) return;
+    void loadRemoteDirectory(activeTerminalId);
+  }));
 
   createEffect(() => {
     if (retryTimer !== undefined) {
@@ -200,22 +233,6 @@ export default function FileBrowser() {
     activeView().currentPath;
     visibleEntries().length;
     resetTypeahead();
-  });
-
-  createEffect(() => {
-    const error = activeView().error;
-    if (errorOverlayTimer !== undefined) {
-      window.clearTimeout(errorOverlayTimer);
-      errorOverlayTimer = undefined;
-    }
-
-    setVisibleError(error);
-    if (error) {
-      errorOverlayTimer = window.setTimeout(() => {
-        setVisibleError("");
-        errorOverlayTimer = undefined;
-      }, 2000);
-    }
   });
 
   createEffect(() => {
@@ -247,9 +264,6 @@ export default function FileBrowser() {
   onCleanup(() => {
     if (retryTimer !== undefined) {
       window.clearTimeout(retryTimer);
-    }
-    if (errorOverlayTimer !== undefined) {
-      window.clearTimeout(errorOverlayTimer);
     }
     if (typeaheadResetTimer !== undefined) {
       window.clearTimeout(typeaheadResetTimer);
@@ -292,7 +306,7 @@ export default function FileBrowser() {
   };
 
   const focusListing = () => {
-    listingRef?.focus();
+    listingRef?.focus({ preventScroll: true });
   };
 
   const resetTypeahead = () => {
@@ -319,30 +333,55 @@ export default function FileBrowser() {
 
     const singleCharacterQuery = typedCharacter.toLocaleLowerCase();
     const nextQuery = `${typeaheadQuery()}${typedCharacter}`.toLocaleLowerCase();
-    const startIndex = Math.max(0, entries.findIndex((entry) => entry.path === activeView().selectedPaths[0]));
-    const rotatedEntries = [...entries.slice(startIndex), ...entries.slice(0, startIndex)];
-    const match = rotatedEntries.find((entry) => entry.name.toLocaleLowerCase().startsWith(nextQuery))
-      ?? entries.find((entry) => entry.name.toLocaleLowerCase().startsWith(nextQuery));
-    const fallbackMatch = rotatedEntries.find((entry) => entry.name.toLocaleLowerCase().startsWith(singleCharacterQuery))
-      ?? entries.find((entry) => entry.name.toLocaleLowerCase().startsWith(singleCharacterQuery));
+    const selectedPath = activeView().selectedPaths[0];
+    const startIndex = Math.max(0, entries.findIndex((entry) => entry.path === selectedPath));
+    let matchIndex = -1;
+    let fallbackIndex = -1;
+    for (let offset = 0; offset < entries.length; offset++) {
+      const index = (startIndex + offset) % entries.length;
+      const name = entries[index].name.toLocaleLowerCase();
+      if (name.startsWith(nextQuery)) {
+        matchIndex = index;
+        break;
+      }
+      if (fallbackIndex === -1 && name.startsWith(singleCharacterQuery)) fallbackIndex = index;
+    }
 
-    const resolvedMatch = match ?? fallbackMatch;
-    if (!resolvedMatch) {
+    const index = matchIndex === -1 ? fallbackIndex : matchIndex;
+    if (index === -1) {
       resetTypeahead();
       return;
     }
 
-    setTypeaheadQuery(match ? nextQuery : singleCharacterQuery);
+    setTypeaheadQuery(matchIndex === -1 ? singleCharacterQuery : nextQuery);
     queueTypeaheadReset();
-    setSelectedPaths([resolvedMatch.path], resolvedMatch.path);
-    entryRefs.get(resolvedMatch.path)?.scrollIntoView({ block: "nearest" });
+    const path = entries[index].path;
+    setSelectedPaths([path], path);
+    if (scrollRef) {
+      const top = index * listingRowHeight;
+      const bottom = top + listingRowHeight;
+      if (top < scrollRef.scrollTop) scrollRef.scrollTop = top;
+      else if (bottom > scrollRef.scrollTop + scrollRef.clientHeight) scrollRef.scrollTop = bottom - scrollRef.clientHeight;
+      setScrollTop(scrollRef.scrollTop);
+    }
   };
 
   const handleListingKeyDown = (event: KeyboardEvent) => {
     if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) return;
-    if (event.key.length !== 1 || /\p{C}/u.test(event.key)) return;
     if (contextMenu() || renameDialog() || newFolderDialog() !== null) return;
 
+    if (event.key === "Enter") {
+      const entries = selectedEntries();
+      const entry = entries[0];
+      if (event.repeat || entries.length !== 1 || !entry?.isDir) return;
+
+      event.preventDefault();
+      resetTypeahead();
+      void openEntry(entry);
+      return;
+    }
+
+    if (event.key.length !== 1 || /\p{C}/u.test(event.key)) return;
     event.preventDefault();
     selectEntryByTyping(event.key);
   };
@@ -353,13 +392,16 @@ export default function FileBrowser() {
     focusListing();
     resetTypeahead();
 
-    const visiblePaths = visibleEntries().map((item) => item.path);
-    const currentSelection = new Set(activeView().selectedPaths);
-
     const additive = event.ctrlKey || event.metaKey;
+    if (!event.shiftKey && !additive) {
+      setSelectedPaths([entry.path], entry.path);
+      return;
+    }
+
+    const visiblePaths = visibleEntries().map((item) => item.path);
     if (event.shiftKey) {
       const anchorPath = activeView().selectionAnchorPath ?? entry.path;
-      const nextSelection = additive ? new Set(currentSelection) : new Set<string>();
+      const nextSelection = new Set(additive ? activeView().selectedPaths : []);
       for (const path of selectionRange(visiblePaths, anchorPath, entry.path)) {
         nextSelection.add(path);
       }
@@ -367,17 +409,9 @@ export default function FileBrowser() {
       return;
     }
 
-    if (additive) {
-      if (currentSelection.has(entry.path)) {
-        currentSelection.delete(entry.path);
-      } else {
-        currentSelection.add(entry.path);
-      }
-      setSelectedPaths(orderedSelection(visiblePaths, currentSelection), entry.path);
-      return;
-    }
-
-    setSelectedPaths([entry.path], entry.path);
+    const currentSelection = new Set(activeView().selectedPaths);
+    if (!currentSelection.delete(entry.path)) currentSelection.add(entry.path);
+    setSelectedPaths(orderedSelection(visiblePaths, currentSelection), entry.path);
   };
 
   const openEntry = async (entry: RemoteFileEntry) => {
@@ -467,6 +501,7 @@ export default function FileBrowser() {
   const handleUpload = async () => {
     const activeTerminalId = terminalId();
     if (!activeTerminalId) return;
+    const currentPath = activeView().currentPath;
 
     clearSftpViewError(activeTerminalId);
     let paths: string[];
@@ -485,27 +520,28 @@ export default function FileBrowser() {
 
     if (paths.length === 0) return;
 
-    let uploadError = "";
-
     try {
-      const currentPath = activeView().currentPath;
       await uploadLocalFiles(activeTerminalId, paths.map((localPath) => ({
         remotePath: joinRemotePath(currentPath, localBaseName(localPath)),
         localPath,
       })));
     } catch (error) {
       if (isSftpQueueCancelledError(error)) return;
-      uploadError = formatErrorMessage(error, "Failed to upload file");
-      setSftpViewError(activeTerminalId, uploadError);
-    } finally {
-      if (uploadError) {
-        setSftpViewError(activeTerminalId, uploadError);
-      }
+      setSftpViewError(activeTerminalId, formatErrorMessage(error, "Failed to upload file"));
     }
   };
 
   const activeTransfers = createMemo(() => getTransfersForTerminal(terminalId()));
   const deleteProgress = createMemo(() => getDeleteProgressForTerminal(terminalId()));
+  const activityError = createMemo(() => {
+    const error = activeView().error;
+    if (activeTransfers().some((item) => item.error === error) || deleteProgress().some((item) => item.error === error)) return "";
+    return error;
+  });
+  const dismissViewError = (error: string) => {
+    const activeTerminalId = terminalId();
+    if (activeTerminalId && activeView().error === error) clearSftpViewError(activeTerminalId);
+  };
   const cancelQueue = async (queueId: string) => {
     const activeTerminalId = terminalId();
     if (!activeTerminalId) return;
@@ -587,29 +623,21 @@ export default function FileBrowser() {
         </Show>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
-        <Show when={visibleError()}>
-          <div style={{
-            position: "absolute",
-            top: "8px",
-            left: "8px",
-            right: "8px",
-            color: "var(--app-danger)",
-            "font-size": "12px",
-            padding: "8px",
-            background: "var(--app-surface)",
-            border: "1px solid var(--app-danger)",
-            "border-radius": "4px",
-            "z-index": 2,
-            "box-shadow": "0 6px 18px rgba(0, 0, 0, 0.25)",
-          }}>
-            {visibleError()}
-          </div>
-        </Show>
+      <div
+        ref={scrollRef}
+        onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+        style={{ flex: 1, "min-height": 0, overflow: "auto", "overflow-anchor": "none" }}
+      >
         <div
           ref={listingRef}
           tabindex={0}
-          style={{ height: "100%", outline: "none" }}
+          style={{
+            "min-height": "100%",
+            "box-sizing": "border-box",
+            "padding-top": `${firstRow() * listingRowHeight}px`,
+            "padding-bottom": `${(visibleEntries().length - endRow()) * listingRowHeight}px`,
+            outline: "none",
+          }}
           onKeyDown={handleListingKeyDown}
           onBlur={() => resetTypeahead()}
           onMouseDown={(event) => {
@@ -628,10 +656,9 @@ export default function FileBrowser() {
             setContextMenu({ x: event.clientX, y: event.clientY, entry: null });
           }}
         >
-        <For each={visibleEntries()}>
+        <For each={renderedEntries()}>
           {(entry) => (
             <div
-              ref={(element) => entryRefs.set(entry.path, element)}
               onMouseDown={(event) => handleEntryMouseDown(event, entry)}
               onDblClick={() => void openEntry(entry)}
               onContextMenu={(event) => {
@@ -644,7 +671,13 @@ export default function FileBrowser() {
                 }
                 setContextMenu({ x: event.clientX, y: event.clientY, entry });
               }}
-              style={{ ...listingRowStyle, "background-color": selectedPathSet().has(entry.path) ? "var(--app-selection)" : "transparent" }}
+              style={{
+                ...listingRowStyle,
+                "box-sizing": "border-box",
+                height: `${listingRowHeight}px`,
+                "align-items": "center",
+                "background-color": selectedPathSet().has(entry.path) ? "var(--app-selection)" : "transparent",
+              }}
             >
               <span style={listingIconStyle}>{entryIcon(entry)}</span>
               <div style={{ overflow: "hidden" }}>
@@ -668,100 +701,92 @@ export default function FileBrowser() {
         </div>
       </div>
 
-      <Show when={activeTransfers().length > 0}>
-        <div style={{ "border-top": "1px solid var(--app-border)", background: "var(--app-surface)", padding: "8px", display: "flex", "flex-direction": "column", gap: "6px" }}>
+      <Show when={activeTransfers().length > 0 || deleteProgress().length > 0 || activityError()}>
+        <div class="sftp-activity">
+          <Show when={activityError()}>
+            {(error) => <ActivityError message={error()} dismiss={() => dismissViewError(error())} />}
+          </Show>
           <For each={activeTransfers()}>
             {(transfer) => {
+              const action = transfer.direction === "upload" ? "Upload" : "Download";
               const isCancelled = () => isSftpQueueCancelledError(transfer.error);
+              const isCancelling = () => !transfer.done && !!fileBrowser.cancellingQueues[transfer.queueId];
               const percent = () => transfer.total === null
                 ? null
                 : transfer.total === 0
                   ? 100
                   : Math.min(100, Math.round((transfer.transferred / transfer.total) * 100));
               const progressLabel = () => {
-                const p = percent();
-                return p === null
-                  ? transfer.transferred > 0
-                    ? formatBytes(transfer.transferred)
-                    : ""
-                  : `${p}%`;
+                if (transfer.done && !transfer.path) return "";
+                const value = percent();
+                if (value !== null) return value + "%";
+                return transfer.transferred > 0 ? formatBytes(transfer.transferred) : "";
               };
               const speedLabel = () => {
-                if (transfer.done || transfer.error || isCancelled()) return "";
+                if (transfer.done || isCancelling()) return "";
                 return formatTransferSpeed(getTransferSpeed(transfer.terminalId, transfer.queueId, transfer.transferId));
               };
-              const transferTitle = () => {
-                if (isCancelled()) {
-                  return `${transfer.direction === "upload" ? "Upload" : "Download"} cancelled`;
-                }
-                return `${transfer.direction === "upload" ? "Upload" : "Download"} ${transfer.displayPath}`;
+              const title = () => {
+                if (isCancelled()) return action + " cancelled";
+                if (isCancelling()) return "Cancelling " + action.toLowerCase() + "…";
+                if (transfer.error) return action + " failed · " + transfer.displayPath;
+                if (transfer.done) return transfer.path ? action + " complete · " + transfer.displayPath : transfer.displayPath;
+                return action + " " + transfer.displayPath;
               };
               return (
                 <div>
-                  <div style={{ display: "flex", "justify-content": "space-between", gap: "8px", "font-size": "11px", color: transfer.error ? "var(--app-danger)" : "var(--app-text)" }}>
-                    <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
-                      {transferTitle()}
-                    </span>
-                    <span style={{ "white-space": "nowrap" }}>{isCancelled() ? "" : [progressLabel(), speedLabel()].filter(Boolean).join("\u00A0\u2022\u00A0")}</span>
+                  <div class="sftp-activity__summary" classList={{ "sftp-activity__summary--error": !!transfer.error && !isCancelled() }}>
+                    <span title={title()}>{title()}</span>
+                    <span>{isCancelled() ? "" : [progressLabel(), speedLabel()].filter(Boolean).join("\u00A0\u2022\u00A0")}</span>
                   </div>
-                  <div style={{ display: "flex", "align-items": "center", gap: "8px", margin: "4px 0 0" }}>
-                    <div style={{ flex: 1, height: "4px", background: "var(--app-progress-track)", "border-radius": "999px", overflow: "hidden" }}>
-                      <div
-                        class={percent() === null ? "sftp-progress-fill sftp-progress-fill--indeterminate" : "sftp-progress-fill"}
-                        style={{
-                          width: percent() === null ? "38%" : `${percent()}%`,
-                          background: transfer.error ? "var(--app-danger)" : "var(--app-accent)",
-                        }}
-                      />
-                    </div>
-                    <Show when={!transfer.done && !transfer.error}>
-                      <button
-                        class="sftp-transfer-cancel-btn"
-                        type="button"
-                        title="Cancel transfer queue"
-                        aria-label="Cancel transfer queue"
-                        onClick={() => void cancelQueue(transfer.queueId)}
-                      >
-                        x
-                      </button>
-                    </Show>
+                  <ActivityProgress
+                    title={title()} percent={percent()} done={transfer.done} error={!!transfer.error && !isCancelled()}
+                    cancelled={isCancelled()} cancelling={isCancelling()}
+                    cancelLabel="Cancel transfer queue" cancel={() => void cancelQueue(transfer.queueId)}
+                  />
+                  <Show when={!isCancelled() && transfer.error}>
+                    {(error) => <ActivityError message={error()} dismiss={() => {
+                      dismissViewError(error());
+                      dismissSftpTransfer(transfer.terminalId, transfer.queueId, transfer.transferId);
+                    }} />}
+                  </Show>
+                </div>
+              );
+            }}
+          </For>
+          <For each={deleteProgress()}>
+            {(progress) => {
+              const isCancelled = () => isSftpQueueCancelledError(progress.error);
+              const isCancelling = () => !progress.done && !!fileBrowser.cancellingQueues[progress.queueId];
+              const percent = () => progress.total === 0 ? 100 : Math.min(100, Math.round((progress.deleted / progress.total) * 100));
+              const title = () => {
+                if (isCancelling()) return "Cancelling after current item…";
+                if (isCancelled()) return "Delete cancelled";
+                if (progress.error) return "Delete failed";
+                return progress.done ? "Deleted" : "Deleting…";
+              };
+              return (
+                <div>
+                  <div class="sftp-activity__summary" classList={{ "sftp-activity__summary--error": !!progress.error && !isCancelled() }}>
+                    <span>{title()}</span>
+                    <span>{progress.deleted}/{progress.total}</span>
                   </div>
+                  <ActivityProgress
+                    title={title()} percent={percent()} done={progress.done} error={!!progress.error && !isCancelled()}
+                    cancelled={isCancelled()} cancelling={isCancelling()}
+                    cancelLabel="Cancel delete queue" cancel={() => void cancelQueue(progress.queueId)}
+                  />
+                  <Show when={!isCancelled() && progress.error}>
+                    {(error) => <ActivityError message={error()} dismiss={() => {
+                      dismissViewError(error());
+                      dismissSftpDelete(progress.queueId);
+                    }} />}
+                  </Show>
                 </div>
               );
             }}
           </For>
         </div>
-      </Show>
-
-      <Show when={deleteProgress()}>
-        {(progress) => {
-          const isCancelled = () => isSftpQueueCancelledError(progress().error);
-          const percent = () => progress().total === 0 ? 100 : Math.min(100, Math.round((progress().deleted / progress().total) * 100));
-          return (
-            <div style={{ "border-top": "1px solid var(--app-border)", background: "var(--app-surface)", padding: "8px" }}>
-              <div style={{ display: "flex", "justify-content": "space-between", gap: "8px", "font-size": "11px", color: progress().error ? "var(--app-danger)" : "var(--app-text)" }}>
-                <span>{isCancelled() ? "Delete cancelled" : progress().error ? "Delete failed" : progress().done ? "Deleted" : "Deleting..."}</span>
-                <span>{isCancelled() ? "" : `${progress().deleted}/${progress().total}`}</span>
-              </div>
-              <div style={{ display: "flex", "align-items": "center", gap: "8px", margin: "4px 0 0" }}>
-                <div style={{ flex: 1, height: "4px", background: "var(--app-progress-track)", "border-radius": "999px", overflow: "hidden" }}>
-                  <div style={{ width: `${percent()}%`, height: "100%", background: progress().error ? "var(--app-danger)" : "var(--app-accent)", transition: "width 0.15s ease" }} />
-                </div>
-                <Show when={!progress().done && !progress().error}>
-                  <button
-                    class="sftp-transfer-cancel-btn"
-                    type="button"
-                    title="Cancel delete queue"
-                    aria-label="Cancel delete queue"
-                    onClick={() => void cancelQueue(progress().queueId)}
-                  >
-                    x
-                  </button>
-                </Show>
-              </div>
-            </div>
-          );
-        }}
       </Show>
 
       <Show when={contextMenu()}>
@@ -994,6 +1019,55 @@ export default function FileBrowser() {
           </div>
         </div>
       </Show>
+    </div>
+  );
+}
+
+function ActivityProgress(props: {
+  title: string;
+  percent: number | null;
+  done: boolean;
+  error: boolean;
+  cancelled: boolean;
+  cancelling: boolean;
+  cancelLabel: string;
+  cancel: () => void;
+}) {
+  const indeterminate = () => props.percent === null && !props.done;
+  const width = () => props.percent === null
+    ? (props.cancelled ? "0%" : props.done && !props.error ? "100%" : "38%")
+    : props.percent + "%";
+  const color = () => props.error ? "var(--app-danger)" : props.cancelled ? "var(--app-muted)" : "var(--app-accent)";
+  return (
+    <div class="sftp-activity__progress">
+      <div class="sftp-activity__track" role="progressbar" aria-label={props.title} aria-valuenow={props.percent ?? undefined}>
+        <div
+          class="sftp-progress-fill"
+          classList={{ "sftp-progress-fill--indeterminate": indeterminate() }}
+          style={{ width: width(), background: color() }}
+        />
+      </div>
+      <Show when={!props.done}>
+        <button
+          class="sftp-transfer-cancel-btn"
+          type="button"
+          title={props.cancelLabel}
+          aria-label={props.cancelLabel}
+          disabled={props.cancelling}
+          onClick={props.cancel}
+        >
+          x
+        </button>
+      </Show>
+    </div>
+  );
+}
+
+function ActivityError(props: { message: string; dismiss: () => void }) {
+  return (
+    <div class="sftp-activity-error">
+      <span role="alert">{props.message}</span>
+      <button type="button" class="sftp-transfer-cancel-btn" aria-label="Dismiss error" onClick={props.dismiss}>×</button>
     </div>
   );
 }

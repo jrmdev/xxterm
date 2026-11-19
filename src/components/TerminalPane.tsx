@@ -5,6 +5,7 @@ import type { Terminal } from "../stores/terminals";
 import {
   addTerminalProfile,
   deleteTerminalProfile,
+  detectedPlatform,
   getDefaultTerminalProfile,
   getTerminalProfiles,
   initPlatformProfiles,
@@ -14,8 +15,27 @@ import {
   type TerminalProfile,
 } from "../stores/terminalProfiles";
 import { setSidebarPane, syncSidebarWithActiveTerminal } from "../stores/fileBrowser";
+import { getStartupAdminTerminal, openAdminTerminal, type AdminShell, type AdminTerminal } from "../ipc/commands";
 
 const TerminalTab = lazy(() => import("./TerminalTab"));
+
+const windowsAdminProfiles: { shell: AdminShell; name: string }[] = [
+  { shell: "cmd", name: "Command Prompt (Admin)" },
+  { shell: "powershell", name: "PowerShell (Admin)" },
+];
+
+function addAdminTab({ shell, program }: AdminTerminal) {
+  const profile = windowsAdminProfiles.find((profile) => profile.shell === shell);
+  if (!profile) return;
+  addTerminal(undefined, "local", undefined, {
+    id: `windows:admin:${shell}`,
+    name: profile.name,
+    program,
+    args: "",
+    defaultWorkingDirectory: "",
+    platform: "windows",
+  });
+}
 
 export default function TerminalPane() {
   const [profileMenu, setProfileMenu] = createSignal<{ x: number; y: number } | null>(null);
@@ -26,6 +46,7 @@ export default function TerminalPane() {
   const [profileArgs, setProfileArgs] = createSignal("");
   const [profileWorkingDirectory, setProfileWorkingDirectory] = createSignal("");
   const [profileError, setProfileError] = createSignal("");
+  const [adminLaunchError, setAdminLaunchError] = createSignal("");
   const [tabContextMenu, setTabContextMenu] = createSignal<{ x: number; y: number; tabId: string; label: string } | null>(null);
   const [showRenameDialog, setShowRenameDialog] = createSignal(false);
   const [renameTabId, setRenameTabId] = createSignal<string | null>(null);
@@ -36,8 +57,15 @@ export default function TerminalPane() {
   let dragState: { tabId: string; pointerId: number; startX: number; dragging: boolean } | null = null;
   let suppressNextTabClick = false;
 
-  onMount(() => {
-    initPlatformProfiles();
+  onMount(async () => {
+    await initPlatformProfiles();
+    if (detectedPlatform !== "windows") return;
+    try {
+      const terminal = await getStartupAdminTerminal();
+      if (terminal) addAdminTab(terminal);
+    } catch (error) {
+      setAdminLaunchError(String(error));
+    }
   });
 
   createEffect(() => {
@@ -172,6 +200,17 @@ export default function TerminalPane() {
   const openTerminalProfile = (profile: TerminalProfile) => {
     setProfileMenu(null);
     addTerminal(undefined, "local", undefined, profile);
+  };
+
+  const openAdminProfile = async (shell: AdminShell) => {
+    setProfileMenu(null);
+    setAdminLaunchError("");
+    try {
+      const terminal = await openAdminTerminal(shell);
+      if (terminal) addAdminTab(terminal);
+    } catch (error) {
+      setAdminLaunchError(String(error));
+    }
   };
 
   createEffect(() => {
@@ -417,6 +456,12 @@ export default function TerminalPane() {
       </div>
 
       {/* Terminal area */}
+      <Show when={adminLaunchError()}>
+        <div class="form-error" role="alert" style={{ display: "flex", "align-items": "center", "justify-content": "space-between", gap: "8px" }}>
+          <span>Could not open administrator terminal. {adminLaunchError()}</span>
+          <button class="form-icon-button" onClick={() => setAdminLaunchError("")} aria-label="Dismiss administrator terminal error">×</button>
+        </div>
+      </Show>
       <div style={{
         flex: 1,
         position: "relative",
@@ -432,8 +477,8 @@ export default function TerminalPane() {
                 right: 0,
                 bottom: 0,
                 background: "var(--terminal-background)",
-                visibility: terminals.activeId === tab.id ? "visible" : "hidden",
-                "pointer-events": terminals.activeId === tab.id ? "auto" : "none",
+                // xterm pauses rendering while its screen is out of layout.
+                display: terminals.activeId === tab.id ? "block" : "none",
               }}
             >
               <Suspense>
@@ -471,10 +516,10 @@ export default function TerminalPane() {
             "box-shadow": "0 4px 12px rgba(0,0,0,0.3)",
           }}
         >
-          <For each={getTerminalProfiles()}>
+          <For each={detectedPlatform === "windows" ? [...getTerminalProfiles(), ...windowsAdminProfiles] : getTerminalProfiles()}>
             {(profile) => (
               <div
-                onClick={() => openTerminalProfile(profile)}
+                onClick={() => "shell" in profile ? openAdminProfile(profile.shell) : openTerminalProfile(profile)}
                 style={menuItemStyle}
                 onMouseEnter={(e) => (e.currentTarget.style.background = "var(--app-surface-hover)")}
                 onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}

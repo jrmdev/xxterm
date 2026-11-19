@@ -1,4 +1,4 @@
-import { createEffect, createSignal, lazy, Suspense } from "solid-js";
+import { createEffect, createSignal, lazy, onCleanup, Suspense } from "solid-js";
 import SessionList from "./SessionList";
 import { openSettingsPanel } from "../stores/settings";
 import { fileBrowser, setSidebarPane, syncSidebarWithActiveTerminal } from "../stores/fileBrowser";
@@ -11,7 +11,8 @@ export default function Sidebar() {
   const [collapsed, setCollapsed] = createSignal(false);
   const [sidebarWidth, setSidebarWidth] = createSignal(240);
   let sidebarRef: HTMLDivElement | undefined;
-  let isDragging = false;
+  let stopDragging: (() => void) | undefined;
+  onCleanup(() => stopDragging?.());
 
   createEffect(() => {
     const active = getActiveTerminal();
@@ -21,21 +22,34 @@ export default function Sidebar() {
   });
 
   const onMouseDown = (e: MouseEvent) => {
+    if (e.button !== 0 || collapsed()) return;
     e.preventDefault();
-    isDragging = true;
+    stopDragging?.();
     const startX = e.clientX;
     const startWidth = sidebarWidth();
+    let pointerX = startX;
+    let frame: number | undefined;
 
     const onMouseMove = (ev: MouseEvent) => {
-      if (!isDragging) return;
-      const newWidth = Math.max(100, Math.min(600, startWidth + ev.clientX - startX));
-      setSidebarWidth(newWidth);
+      pointerX = ev.clientX;
+      if (frame !== undefined) return;
+      frame = requestAnimationFrame(() => {
+        frame = undefined;
+        setSidebarWidth(Math.max(100, Math.min(600, startWidth + pointerX - startX)));
+      });
     };
 
-    const onMouseUp = () => {
-      isDragging = false;
+    const onMouseUp = (ev: MouseEvent) => {
+      if (ev.button !== 0) return;
+      stopDragging?.();
+      setSidebarWidth(Math.max(100, Math.min(600, startWidth + ev.clientX - startX)));
+    };
+
+    stopDragging = () => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
       document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("mouseup", onMouseUp);
+      stopDragging = undefined;
     };
 
     document.addEventListener("mousemove", onMouseMove);

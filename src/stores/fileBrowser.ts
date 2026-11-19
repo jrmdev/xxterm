@@ -82,7 +82,8 @@ export const [fileBrowser, setFileBrowser] = createStore<{
   views: Record<string, SftpViewState>;
   transfers: TransferState[];
   transferRates: Record<string, TransferRateState>;
-  deleteProgress: DeleteProgressState | null;
+  deleteProgress: Record<string, DeleteProgressState>;
+  cancellingQueues: Record<string, string>;
   editUploadError: EditUploadErrorState | null;
 }>({
   activePane: "sessions",
@@ -91,24 +92,16 @@ export const [fileBrowser, setFileBrowser] = createStore<{
   views: {},
   transfers: [],
   transferRates: {},
-  deleteProgress: null,
+  deleteProgress: {},
+  cancellingQueues: {},
   editUploadError: null,
 });
 
 let sftpEventListenersBound = false;
 let sftpEventListenersPromise: Promise<void> | null = null;
-const directoryLoadTokens = new Map<string, number>();
+const directoryLoads = new Map<string, { token: number; sessionId: number; path: string }>();
+let directoryLoadToken = 0;
 let transferRateIntervalId: number | null = null;
-
-function nextDirectoryLoadToken(terminalId: string) {
-  const nextToken = (directoryLoadTokens.get(terminalId) ?? 0) + 1;
-  directoryLoadTokens.set(terminalId, nextToken);
-  return nextToken;
-}
-
-function isCurrentDirectoryLoad(terminalId: string, token: number) {
-  return directoryLoadTokens.get(terminalId) === token;
-}
 
 function transferRateKey(terminalId: string, queueId: string, transferId: string) {
   return `${terminalId}:${queueId}:${transferId}`;
@@ -219,6 +212,9 @@ function upsertTransfer(incoming: TransferState) {
     && item.transferId === incoming.transferId
   );
   if (index >= 0) {
+    if (fileBrowser.transfers[index].path !== incoming.path) {
+      setFileBrowser("transferRates", transferRateKey(incoming.terminalId, incoming.queueId, incoming.transferId), undefined!);
+    }
     setFileBrowser("transfers", index, incoming);
     return;
   }
@@ -226,7 +222,9 @@ function upsertTransfer(incoming: TransferState) {
   setFileBrowser("transfers", (current) => {
     const next = [...current, incoming];
     while (next.length > 6) {
-      const completedIndex = next.findIndex((item) => item.done || item.error);
+      const completedIndex = next.findIndex((item) =>
+        item.done && (!item.error || isSftpQueueCancelledError(item.error)),
+      );
       if (completedIndex === -1) break;
       next.splice(completedIndex, 1);
     }
@@ -236,13 +234,24 @@ function upsertTransfer(incoming: TransferState) {
 
 export function isSftpQueueCancelledError(error: unknown) {
   const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  return /(?:^|[\s-])(transfer|upload|download|delete) cancel(?:ed|led)\b/i.test(message);
+  return /^(transfer|upload|download|delete) cancel(?:ed|led)$/i.test(message.trim());
 }
 
 function sftpProgressDismissDelay(error: string | null) {
   if (!error) return 1800;
   if (isSftpQueueCancelledError(error)) return 1000;
-  return 6000;
+  return null;
+}
+
+export function dismissSftpTransfer(terminalId: string, queueId: string, transferId: string) {
+  setFileBrowser("transfers", (current) => current.filter((item) => !(
+    item.terminalId === terminalId && item.queueId === queueId && item.transferId === transferId
+  )));
+  setFileBrowser("transferRates", transferRateKey(terminalId, queueId, transferId), undefined!);
+}
+
+export function dismissSftpDelete(queueId: string) {
+  setFileBrowser("deleteProgress", queueId, undefined!);
 }
 
 export function setSftpViewError(terminalId: string, error: string) {
@@ -265,41 +274,33 @@ export async function ensureSftpEventListeners() {
   sftpEventListenersPromise = Promise.all([
     listen<TransferState>("sftp-transfer-progress", (event) => {
       const incoming = event.payload;
+      if (!fileBrowser.views[incoming.terminalId]) return;
       upsertTransfer(incoming);
       updateTransferRateSample(incoming);
 
       if (incoming.done) {
-        window.setTimeout(() => {
-          batch(() => {
-            setFileBrowser("transfers", (current) =>
-              current.filter((item) => !(
-                item.terminalId === incoming.terminalId
-                && item.queueId === incoming.queueId
-                && item.transferId === incoming.transferId
-              ))
-            );
-            setFileBrowser("transferRates", transferRateKey(incoming.terminalId, incoming.queueId, incoming.transferId), undefined!);
-          });
-        }, sftpProgressDismissDelay(incoming.error));
+        setFileBrowser("cancellingQueues", incoming.queueId, undefined!);
+        const delay = sftpProgressDismissDelay(incoming.error);
+        if (delay !== null) {
+          window.setTimeout(() => dismissSftpTransfer(incoming.terminalId, incoming.queueId, incoming.transferId), delay);
+        }
       }
     }),
     listen<DeleteProgressState>("sftp-delete-progress", (event) => {
       const incoming = event.payload;
-      setFileBrowser("deleteProgress", incoming);
+      if (!fileBrowser.views[incoming.terminalId]) return;
+      setFileBrowser("deleteProgress", incoming.queueId, incoming);
       if (incoming.done) {
-        window.setTimeout(() => {
-          setFileBrowser("deleteProgress", (current) =>
-            current?.terminalId === incoming.terminalId && current?.deleted === incoming.deleted ? null : current
-          );
-        }, sftpProgressDismissDelay(incoming.error));
+        setFileBrowser("cancellingQueues", incoming.queueId, undefined!);
+        const delay = sftpProgressDismissDelay(incoming.error);
+        if (delay !== null) {
+          window.setTimeout(() => dismissSftpDelete(incoming.queueId), delay);
+        }
       }
     }),
     listen<EditUploadErrorState>("sftp-edit-upload-error", (event) => {
       const incoming = event.payload;
       setFileBrowser("editUploadError", incoming);
-      if (fileBrowser.views[incoming.terminalId]) {
-        setFileBrowser("views", incoming.terminalId, "error", incoming.error);
-      }
     }),
   ])
     .then(() => {
@@ -379,17 +380,21 @@ export function openSftpForTerminal(terminalId: string, sessionId: number) {
 }
 
 export function clearSftpView(terminalId: string) {
-  directoryLoadTokens.delete(terminalId);
-  const nextViews = { ...fileBrowser.views };
-  const nextTransferRates = Object.fromEntries(
-    Object.entries(fileBrowser.transferRates).filter(([key]) => !key.startsWith(`${terminalId}:`))
-  );
-  delete nextViews[terminalId];
+  directoryLoads.delete(terminalId);
   batch(() => {
-    setFileBrowser("views", nextViews);
+    setFileBrowser("views", terminalId, undefined!);
     setFileBrowser("transfers", (current) => current.filter((item) => item.terminalId !== terminalId));
-    setFileBrowser("transferRates", nextTransferRates);
-    setFileBrowser("deleteProgress", (current) => current?.terminalId === terminalId ? null : current);
+    for (const key of Object.keys(fileBrowser.transferRates)) {
+      if (key.startsWith(`${terminalId}:`)) {
+        setFileBrowser("transferRates", key, undefined!);
+      }
+    }
+    for (const progress of Object.values(fileBrowser.deleteProgress)) {
+      if (progress.terminalId === terminalId) dismissSftpDelete(progress.queueId);
+    }
+    for (const [queueId, owner] of Object.entries(fileBrowser.cancellingQueues)) {
+      if (owner === terminalId) setFileBrowser("cancellingQueues", queueId, undefined!);
+    }
   });
   if (fileBrowser.activeTerminalId === terminalId) {
     setFileBrowser("activeTerminalId", null);
@@ -437,9 +442,11 @@ export async function loadRemoteDirectory(terminalId: string, path?: string) {
   const sessionId = view.sessionId;
   if (!sessionId) return;
 
-  const requestedPath = path ?? view.currentPath;
-  const loadToken = nextDirectoryLoadToken(terminalId);
-  const isStale = () => fileBrowser.views[terminalId]?.sessionId !== sessionId || !isCurrentDirectoryLoad(terminalId, loadToken);
+  const pending = directoryLoads.get(terminalId);
+  const requestedPath = path ?? (pending?.sessionId === sessionId ? pending.path : view.currentPath);
+  const token = ++directoryLoadToken;
+  directoryLoads.set(terminalId, { token, sessionId, path: requestedPath });
+  const isStale = () => fileBrowser.views[terminalId]?.sessionId !== sessionId || directoryLoads.get(terminalId)?.token !== token;
   batch(() => {
     setFileBrowser("views", terminalId, "sftpStatus", "initializing");
     setFileBrowser("views", terminalId, "loading", true);
@@ -470,8 +477,10 @@ export async function loadRemoteDirectory(terminalId: string, path?: string) {
       });
     }
   } finally {
-    if (isStale()) return;
-    setFileBrowser("views", terminalId, "loading", false);
+    if (!isStale()) {
+      directoryLoads.delete(terminalId);
+      setFileBrowser("views", terminalId, "loading", false);
+    }
   }
 }
 
@@ -488,14 +497,19 @@ export async function deleteRemoteEntries(terminalId: string, entries: RemoteFil
   }
 }
 
-export function getDeleteProgressForTerminal(terminalId: string | null): DeleteProgressState | null {
-  if (!terminalId) return null;
-  const progress = fileBrowser.deleteProgress;
-  return progress?.terminalId === terminalId ? progress : null;
+export function getDeleteProgressForTerminal(terminalId: string | null): DeleteProgressState[] {
+  return terminalId ? Object.values(fileBrowser.deleteProgress).filter((progress) => progress.terminalId === terminalId) : [];
 }
 
 export async function cancelActiveSftpQueue(terminalId: string, queueId: string) {
-  await cancelSftpQueue(terminalId, queueId);
+  if (fileBrowser.cancellingQueues[queueId]) return;
+  setFileBrowser("cancellingQueues", queueId, terminalId);
+  try {
+    await cancelSftpQueue(terminalId, queueId);
+  } catch (error) {
+    setFileBrowser("cancellingQueues", queueId, undefined!);
+    throw error;
+  }
 }
 
 export async function renameRemoteEntry(terminalId: string, oldPath: string, newPath: string) {

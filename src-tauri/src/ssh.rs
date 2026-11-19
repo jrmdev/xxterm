@@ -14,19 +14,17 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::copy_bidirectional;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::crypto;
 use crate::crypto::MasterPasswordState;
-use crate::port_forward::PortForwardState;
 use crate::session_store::{Session, SessionStore};
 use crate::sftp::SftpEditState;
 use crate::terminal_events::TerminalExitEvent;
 
 pub type SharedSshHandle = Arc<AsyncMutex<client::Handle<SshHandler>>>;
+pub(crate) type ForwardHandle = Arc<client::Handle<SshHandler>>;
 type DynamicAgentClient = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
-
-const HEADLESS_SSH_ID_PREFIX: &str = "__port_forward__";
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,55 +33,63 @@ pub struct KeyPassphraseInput {
     pub passphrase: String,
 }
 
-pub struct RemoteForwardMap {
-    pub by_port: Mutex<HashMap<(String, u32), String>>,
+type RemoteForwardRoute = Arc<Mutex<Option<RemoteForwardTarget>>>;
+
+pub(crate) struct RemoteForwardTarget {
+    pub listen_port: u32,
+    pub host: String,
+    pub port: u16,
 }
 
-impl RemoteForwardMap {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            by_port: Mutex::new(HashMap::new()),
-        })
+pub(crate) struct ForwardConnection {
+    pub handle: ForwardHandle,
+    socket: ForwardSocket,
+    closed: watch::Receiver<()>,
+    remote_target: RemoteForwardRoute,
+}
+
+impl ForwardConnection {
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed() || self.socket.closed.load(Ordering::Relaxed)
+    }
+
+    pub fn close(&self) {
+        self.socket.close();
+    }
+
+    pub async fn wait_closed(&self) {
+        let _ = self.closed.clone().changed().await;
+    }
+
+    pub fn set_remote_target(&self, target: Option<RemoteForwardTarget>) {
+        if let Ok(mut current) = self.remote_target.lock() {
+            *current = target;
+        }
     }
 }
 
-pub enum FwdCommand {
-    StartLocal {
-        session_id: i64,
-        local_host: String,
-        local_port: u16,
-        remote_host: String,
-        remote_port: u16,
-        forward_id: i64,
-        stop_rx: tokio::sync::watch::Receiver<bool>,
-        app: tauri::AppHandle,
-    },
-    StartRemote {
-        session_id: i64,
-        local_host: String,
-        local_port: u16,
-        remote_host: String,
-        remote_port: u16,
-        forward_id: i64,
-        stop_rx: tokio::sync::watch::Receiver<bool>,
-        app: tauri::AppHandle,
-    },
-    StartDynamic {
-        session_id: i64,
-        local_host: String,
-        local_port: u16,
-        forward_id: i64,
-        stop_rx: tokio::sync::watch::Receiver<bool>,
-        app: tauri::AppHandle,
-    },
+struct ForwardSocket {
+    socket: std::net::TcpStream,
+    closed: AtomicBool,
+}
+
+impl ForwardSocket {
+    fn close(&self) {
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            let _ = self.socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for ForwardSocket {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 pub struct SshState {
     pub sessions: Mutex<HashMap<String, SshSession>>,
-    pub fwd_commands: Mutex<HashMap<i64, mpsc::UnboundedSender<FwdCommand>>>,
     pub ssh_handles: Mutex<HashMap<String, SharedSshHandle>>,
-    pub headless_sessions: Mutex<HashSet<i64>>,
-    pub remote_forwards: Arc<RemoteForwardMap>,
 }
 
 pub struct SshSession {
@@ -99,31 +105,15 @@ impl SshState {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            fwd_commands: Mutex::new(HashMap::new()),
             ssh_handles: Mutex::new(HashMap::new()),
-            headless_sessions: Mutex::new(HashSet::new()),
-            remote_forwards: RemoteForwardMap::new(),
         }
     }
 }
 
-pub fn headless_ssh_id(session_id: i64) -> String {
-    format!("{}{}", HEADLESS_SSH_ID_PREFIX, session_id)
-}
-
-pub fn has_attached_terminal(state: &SshState, session_id: i64) -> bool {
-    if let Ok(sessions) = state.sessions.lock() {
-        sessions.iter().any(|(id, session)| {
-            session.session_id == session_id && id != &headless_ssh_id(session_id)
-        })
-    } else {
-        false
-    }
-}
-
 pub(crate) struct SshHandler {
-    pub remote_forwards: Arc<RemoteForwardMap>,
     pub agent_forwarding: bool,
+    pub(crate) remote_forward: Option<RemoteForwardRoute>,
+    pub(crate) _connected: Option<watch::Sender<()>>,
 }
 
 impl client::Handler for SshHandler {
@@ -139,31 +129,36 @@ impl client::Handler for SshHandler {
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: russh::Channel<client::Msg>,
-        connected_address: &str,
+        _connected_address: &str,
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        let dest = {
-            let map = self.remote_forwards.by_port.lock().ok();
-            map.as_ref().and_then(|m| {
-                let key = (connected_address.to_string(), connected_port);
-                m.get(&key).cloned().or_else(|| {
-                    // Fall back to port-only lookup (server may report different bind address)
-                    m.iter()
-                        .find(|((_, p), _)| *p == connected_port)
-                        .map(|(_, v)| v.clone())
-                })
-            })
-        };
-        let Some(dest) = dest else { return Ok(()) };
-
+        let destination = self.remote_forward.as_ref().and_then(|route| {
+            let route = route.lock().ok()?;
+            let target = route.as_ref()?;
+            (target.listen_port == 0 || target.listen_port == connected_port)
+                .then(|| (target.host.clone(), target.port))
+        });
         tokio::spawn(async move {
-            match tokio::net::TcpStream::connect(&dest).await {
-                Ok(tcp) => crate::port_forward::bridge_tcp_channel(tcp, channel).await,
-                Err(e) => log::error!("remote forward: connect to {} failed: {}", dest, e),
+            if let Some((host, port)) = destination {
+                let connection = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await;
+                match connection {
+                    Ok(Ok(tcp)) => {
+                        crate::port_forward::bridge_tcp_channel(tcp, channel).await;
+                        return;
+                    }
+                    error => {
+                        log::debug!("remote forward: connect to {host}:{port} failed: {error:?}")
+                    }
+                }
             }
+            let _ = channel.close().await;
         });
         Ok(())
     }
@@ -332,80 +327,6 @@ fn emit_ssh_error(handle: &AppHandle, sid: &str, message: impl AsRef<str>) {
     let _ = handle.emit(&format!("pty-output-{}", sid), &encoded);
 }
 
-/// Dispatch a single port-forward command onto a freshly spawned task.
-fn spawn_forward_command(cmd: FwdCommand, shared_handle: SharedSshHandle) {
-    match cmd {
-        FwdCommand::StartLocal {
-            session_id,
-            local_host,
-            local_port,
-            remote_host,
-            remote_port,
-            forward_id,
-            stop_rx,
-            app,
-        } => {
-            let h = shared_handle.clone();
-            tokio::spawn(async move {
-                crate::port_forward::run_local_forward(
-                    h,
-                    session_id,
-                    local_host,
-                    local_port,
-                    remote_host,
-                    remote_port,
-                    forward_id,
-                    stop_rx,
-                    app,
-                )
-                .await;
-            });
-        }
-        FwdCommand::StartRemote {
-            session_id,
-            local_host,
-            local_port,
-            remote_host,
-            remote_port,
-            forward_id,
-            stop_rx,
-            app,
-        } => {
-            let h = shared_handle.clone();
-            tokio::spawn(async move {
-                crate::port_forward::run_remote_forward(
-                    h,
-                    session_id,
-                    local_host,
-                    local_port,
-                    remote_host,
-                    remote_port,
-                    forward_id,
-                    stop_rx,
-                    app,
-                )
-                .await;
-            });
-        }
-        FwdCommand::StartDynamic {
-            session_id,
-            local_host,
-            local_port,
-            forward_id,
-            stop_rx,
-            app,
-        } => {
-            let h = shared_handle.clone();
-            tokio::spawn(async move {
-                crate::port_forward::run_dynamic_forward(
-                    h, session_id, local_host, local_port, forward_id, stop_rx, app,
-                )
-                .await;
-            });
-        }
-    }
-}
-
 fn resolve_session_chain(
     target_session_id: i64,
     session_store: &SessionStore,
@@ -489,186 +410,195 @@ fn resolve_connection_chain(
 }
 
 async fn connect_authenticated_session(
-    handle: &AppHandle,
-    sid: &str,
     session: &ResolvedSession,
-    upstream: Option<SharedSshHandle>,
-) -> Result<SharedSshHandle, ()> {
+    upstream: Option<&client::Handle<SshHandler>>,
+    forward_socket: Option<&mut Option<ForwardSocket>>,
+    handler: SshHandler,
+) -> Result<client::Handle<SshHandler>, String> {
     let config = Arc::new(client::Config {
         nodelay: true,
-        // Detect dead peers/networks: probe after 15s of silence, give up after
-        // 3 unanswered probes so channels close and cleanup runs (~45-60s).
         keepalive_interval: Some(std::time::Duration::from_secs(15)),
         keepalive_max: 3,
         ..client::Config::default()
     });
-    let handler = SshHandler {
-        remote_forwards: handle.state::<SshState>().remote_forwards.clone(),
-        agent_forwarding: session.auth_method == "agent" && session.agent_forwarding,
+    let address = (session.host.as_str(), session.port);
+    let describe_connect_error = |error: anyhow::Error| {
+        format!(
+            "SSH connection failed for {} ({}:{}): {error}",
+            session.name, session.host, session.port
+        )
     };
-
-    let mut ssh_session = match upstream {
-        Some(upstream_handle) => {
-            let channel = {
-                let upstream = upstream_handle.lock().await;
-                match upstream
-                    .channel_open_direct_tcpip(
-                        session.host.clone(),
-                        session.port as u32,
-                        "127.0.0.1".to_string(),
-                        0,
-                    )
-                    .await
-                {
-                    Ok(channel) => channel,
-                    Err(e) => {
-                        emit_ssh_error(
-                            handle,
-                            sid,
-                            format!(
-                                "Failed to open jump host channel to {} ({}:{}): {}",
-                                session.name, session.host, session.port, e
-                            ),
-                        );
-                        return Err(());
-                    }
-                }
-            };
-
-            match client::connect_stream(config, channel.into_stream(), handler).await {
-                Ok(session_handle) => session_handle,
-                Err(e) => {
-                    emit_ssh_error(
-                        handle,
-                        sid,
-                        format!(
-                            "SSH connection through jump host failed for {} ({}:{}): {}",
-                            session.name, session.host, session.port, e
-                        ),
-                    );
-                    return Err(());
-                }
-            }
-        }
-        None => match client::connect(config, (session.host.as_str(), session.port), handler).await
-        {
-            Ok(session_handle) => session_handle,
-            Err(e) => {
-                emit_ssh_error(
-                    handle,
-                    sid,
-                    format!(
-                        "SSH connection failed for {} ({}:{}): {}",
-                        session.name, session.host, session.port, e
-                    ),
-                );
-                return Err(());
-            }
-        },
+    let mut ssh_session = if let Some(upstream) = upstream {
+        let channel = upstream
+            .channel_open_direct_tcpip(address.0, address.1.into(), "127.0.0.1", 0)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to open jump host channel to {} ({}:{}): {error}",
+                    session.name, session.host, session.port
+                )
+            })?;
+        client::connect_stream(config, channel.into_stream(), handler)
+            .await
+            .map_err(describe_connect_error)?
+    } else if let Some(forward_socket) = forward_socket {
+        let socket = tokio::net::TcpStream::connect(address)
+            .await
+            .and_then(|socket| {
+                socket.set_nodelay(true)?;
+                socket.into_std()
+            })
+            .map_err(|error| describe_connect_error(error.into()))?;
+        *forward_socket = Some(ForwardSocket {
+            socket: socket
+                .try_clone()
+                .map_err(|error| describe_connect_error(error.into()))?,
+            closed: AtomicBool::new(false),
+        });
+        let socket = tokio::net::TcpStream::from_std(socket)
+            .map_err(|error| describe_connect_error(error.into()))?;
+        client::connect_stream(config, socket, handler)
+            .await
+            .map_err(describe_connect_error)?
+    } else {
+        client::connect(config, address, handler)
+            .await
+            .map_err(describe_connect_error)?
     };
 
     let auth_result = match session.auth_method.as_str() {
-        "password" => match session.password.as_ref() {
-            Some(password) => {
-                ssh_session
-                    .authenticate_password(&session.username, password)
-                    .await
-            }
-            None => {
-                emit_ssh_error(
-                    handle,
-                    sid,
-                    format!("No password stored for session {}", session.name),
-                );
-                return Err(());
-            }
-        },
-        "key" => match session.private_key_path.as_ref() {
-            Some(path) => {
-                match russh::keys::load_secret_key(path, session.key_passphrase.as_deref()) {
-                    Ok(key) => {
-                        use russh::keys::PrivateKeyWithHashAlg;
-                        let algorithm = key.algorithm();
-                        let hash_alg = best_rsa_hash_alg(&ssh_session, &algorithm, "ssh key").await;
-                        ssh_session
-                            .authenticate_publickey(
-                                &session.username,
-                                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                            )
-                            .await
-                    }
-                    Err(e) => {
-                        emit_ssh_error(
-                            handle,
-                            sid,
-                            format!(
-                                "Failed to load private key for session {}: {}",
-                                session.name, e
-                            ),
-                        );
-                        return Err(());
-                    }
-                }
-            }
-            None => {
-                emit_ssh_error(
-                    handle,
-                    sid,
-                    format!(
-                        "No private key path configured for session {}",
-                        session.name
-                    ),
-                );
-                return Err(());
-            }
-        },
-        "agent" => match authenticate_with_agent(&mut ssh_session, &session.username).await {
-            Ok(result) => Ok(result),
-            Err(err) => {
-                emit_ssh_error(
-                    handle,
-                    sid,
-                    format!(
-                        "SSH agent authentication failed for session {}: {}",
-                        session.name, err
-                    ),
-                );
-                return Err(());
-            }
-        },
-        other => {
-            emit_ssh_error(
-                handle,
-                sid,
+        "password" => {
+            let password = session
+                .password
+                .as_ref()
+                .ok_or_else(|| format!("No password stored for session {}", session.name))?;
+            ssh_session
+                .authenticate_password(&session.username, password)
+                .await
+        }
+        "key" => {
+            let path = session.private_key_path.clone().ok_or_else(|| {
                 format!(
-                    "Unknown auth method for session {}: {}",
-                    session.name, other
-                ),
-            );
-            return Err(());
+                    "No private key path configured for session {}",
+                    session.name
+                )
+            })?;
+            let passphrase = session.key_passphrase.clone();
+            let key = tokio::task::spawn_blocking(move || {
+                russh::keys::load_secret_key(&path, passphrase.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| {
+                format!(
+                    "Failed to load private key for session {}: {e}",
+                    session.name
+                )
+            })?;
+            let hash_alg = best_rsa_hash_alg(&ssh_session, &key.algorithm(), "ssh key").await;
+            ssh_session
+                .authenticate_publickey(
+                    &session.username,
+                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                )
+                .await
+        }
+        "agent" => Ok(authenticate_with_agent(&mut ssh_session, &session.username)
+            .await
+            .map_err(|e| {
+                format!(
+                    "SSH agent authentication failed for session {}: {e}",
+                    session.name
+                )
+            })?),
+        other => {
+            return Err(format!(
+                "Unknown auth method for session {}: {other}",
+                session.name
+            ))
         }
     };
 
-    if !matches!(auth_result, Ok(AuthResult::Success)) {
-        let err_msg = match auth_result {
-            Err(e) => format!("Authentication error for session {}: {}", session.name, e),
-            _ => format!("Authentication failed for session {}", session.name),
+    match auth_result {
+        Ok(AuthResult::Success) => Ok(ssh_session),
+        Ok(_) => Err(format!(
+            "Authentication failed for session {}",
+            session.name
+        )),
+        Err(e) => Err(format!(
+            "Authentication error for session {}: {e}",
+            session.name
+        )),
+    }
+}
+
+pub(crate) async fn connect_forward_transport(
+    session_id: i64,
+    passphrases: &[KeyPassphraseInput],
+    master_pwd_state: &MasterPasswordState,
+    session_store: &SessionStore,
+) -> Result<ForwardConnection, String> {
+    let chain = resolve_connection_chain(
+        session_id,
+        master_pwd_state,
+        session_store,
+        None,
+        Some(passphrases.to_vec()),
+    )?;
+    connect_forward_chain(&chain).await
+}
+
+async fn connect_forward_chain(chain: &[ResolvedSession]) -> Result<ForwardConnection, String> {
+    let mut socket = None;
+    let mut upstream = None;
+    let (connected, closed) = watch::channel(());
+    let remote_target = Arc::new(Mutex::new(None));
+    for (index, session) in chain.iter().enumerate() {
+        let is_last = index + 1 == chain.len();
+        let handler = SshHandler {
+            remote_forward: is_last.then(|| remote_target.clone()),
+            agent_forwarding: false,
+            _connected: is_last.then(|| connected.clone()),
         };
-        emit_ssh_error(handle, sid, err_msg);
-        return Err(());
+        upstream = Some(
+            connect_authenticated_session(session, upstream.as_ref(), Some(&mut socket), handler)
+                .await?,
+        );
     }
 
-    Ok(Arc::new(AsyncMutex::new(ssh_session)))
+    Ok(ForwardConnection {
+        handle: Arc::new(upstream.ok_or("No SSH session configured")?),
+        socket: socket.ok_or("No SSH transport socket")?,
+        closed,
+        remote_target,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_test_forward_transport(
+    addr: std::net::SocketAddr,
+) -> Result<ForwardConnection, String> {
+    connect_forward_chain(&[ResolvedSession {
+        name: "test SSH".to_string(),
+        host: addr.ip().to_string(),
+        port: addr.port(),
+        username: "test".to_string(),
+        auth_method: "password".to_string(),
+        agent_forwarding: false,
+        password: Some("test".to_string()),
+        private_key_path: None,
+        key_passphrase: None,
+        startup_command: None,
+    }])
+    .await
 }
 
 fn spawn_ssh_task(
     app: AppHandle,
     id: String,
-    session_id: i64,
     cols: u16,
     rows: u16,
     connection_chain: Vec<ResolvedSession>,
-    register_port_forward_transport: bool,
     exit_requested: Arc<AtomicBool>,
 ) -> (
     mpsc::UnboundedSender<Vec<u8>>,
@@ -684,87 +614,33 @@ fn spawn_ssh_task(
 
     tokio::spawn(async move {
         let default_exit_message = "[Process exited]".to_string();
-        let (transport_registered, exit_event) = async {
-            let mut upstream: Option<SharedSshHandle> = None;
-            let mut shared_handle = None;
-
+        let exit_event = async {
+            let mut upstream = None;
             for session in &connection_chain {
-                let next_handle =
-                    match connect_authenticated_session(&handle, &sid, session, upstream.clone())
-                        .await
-                    {
-                        Ok(next_handle) => next_handle,
-                        Err(()) => {
-                            return (
-                                false,
-                                if exit_requested.load(Ordering::SeqCst) {
-                                    TerminalExitEvent::user_initiated()
-                                } else {
-                                    TerminalExitEvent::unexpected(default_exit_message.clone())
-                                },
-                            );
-                        }
-                    };
-                upstream = Some(next_handle.clone());
-                shared_handle = Some(next_handle);
-            }
-
-            let Some(shared_handle) = shared_handle else {
-                emit_ssh_error(&handle, &sid, "No SSH session configured");
-                return (false, TerminalExitEvent::unexpected(default_exit_message.clone()));
-            };
-
-            if let Ok(mut h) = handle.state::<SshState>().ssh_handles.lock() {
-                h.insert(sid.clone(), shared_handle.clone());
-            }
-
-            let (fwd_tx, mut fwd_rx) = mpsc::unbounded_channel::<FwdCommand>();
-            let mut transport_registered = false;
-            if register_port_forward_transport {
-                if let Ok(mut cmds) = handle.state::<SshState>().fwd_commands.lock() {
-                    cmds.insert(session_id, fwd_tx);
-                    transport_registered = true;
-                }
-
-                if transport_registered {
-                    crate::port_forward::process_pending_forwards(&handle, session_id);
-                }
-            }
-
-            if register_port_forward_transport {
-                // The headless transport has no PTY channel whose closure would
-                // signal a dead connection, so poll the transport handle directly.
-                let mut liveness = tokio::time::interval(std::time::Duration::from_secs(15));
-                liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        Some(_) = rx.recv() => {}
-                        Some(_) = resize_rx.recv() => {}
-                        Some(cmd) = fwd_rx.recv() => {
-                            spawn_forward_command(cmd, shared_handle.clone());
-                        }
-                        _ = liveness.tick() => {
-                            if shared_handle.lock().await.is_closed() {
-                                log::info!("ssh {}: transport closed, stopping port forward transport", sid);
-                                break;
-                            }
-                        }
-                        _ = &mut abort_rx => {
-                            log::info!("ssh {}: abort signal received", sid);
-                            break;
-                        }
-                        else => break,
+                let handler = SshHandler {
+                    remote_forward: None,
+                    agent_forwarding: session.auth_method == "agent" && session.agent_forwarding,
+                    _connected: None,
+                };
+                match connect_authenticated_session(session, upstream.as_ref(), None, handler).await {
+                    Ok(next) => upstream = Some(next),
+                    Err(error) => {
+                        emit_ssh_error(&handle, &sid, error);
+                        return if exit_requested.load(Ordering::SeqCst) {
+                            TerminalExitEvent::user_initiated()
+                        } else {
+                            TerminalExitEvent::unexpected(default_exit_message.clone())
+                        };
                     }
                 }
-
-                return (
-                    transport_registered,
-                    if exit_requested.load(Ordering::SeqCst) {
-                        TerminalExitEvent::user_initiated()
-                    } else {
-                        TerminalExitEvent::unexpected(default_exit_message.clone())
-                    },
-                );
+            }
+            let Some(ssh_handle) = upstream else {
+                emit_ssh_error(&handle, &sid, "No SSH session configured");
+                return TerminalExitEvent::unexpected(default_exit_message.clone());
+            };
+            let shared_handle = Arc::new(AsyncMutex::new(ssh_handle));
+            if let Ok(mut handles) = handle.state::<SshState>().ssh_handles.lock() {
+                handles.insert(sid.clone(), shared_handle.clone());
             }
 
             let mut channel = {
@@ -773,10 +649,7 @@ fn spawn_ssh_task(
                     Ok(ch) => ch,
                     Err(e) => {
                         emit_ssh_error(&handle, &sid, format!("Failed to open channel: {}", e));
-                        return (
-                            transport_registered,
-                            TerminalExitEvent::unexpected(default_exit_message.clone()),
-                        );
+                        return TerminalExitEvent::unexpected(default_exit_message.clone());
                     }
                 };
 
@@ -785,10 +658,7 @@ fn spawn_ssh_task(
                     .await
                 {
                     emit_ssh_error(&handle, &sid, format!("Failed to request PTY: {}", e));
-                    return (
-                        transport_registered,
-                        TerminalExitEvent::unexpected(default_exit_message.clone()),
-                    );
+                    return TerminalExitEvent::unexpected(default_exit_message.clone());
                 }
 
                 if connection_chain
@@ -808,10 +678,7 @@ fn spawn_ssh_task(
                             &sid,
                             format!("Failed to start shell: {}; fallback exec failed: {}", shell_err, exec_err),
                         );
-                        return (
-                            transport_registered,
-                            TerminalExitEvent::unexpected(default_exit_message.clone()),
-                        );
+                        return TerminalExitEvent::unexpected(default_exit_message.clone());
                     }
                 }
 
@@ -867,9 +734,6 @@ fn spawn_ssh_task(
                             .window_change(new_cols as u32, new_rows as u32, 0, 0)
                             .await;
                     }
-                    Some(cmd) = fwd_rx.recv() => {
-                        spawn_forward_command(cmd, shared_handle.clone());
-                    }
                     _ = &mut abort_rx => {
                         log::info!("ssh {}: abort signal received", sid);
                         exit_event = TerminalExitEvent::user_initiated();
@@ -881,22 +745,9 @@ fn spawn_ssh_task(
                 }
             }
 
-            (transport_registered, exit_event)
+            exit_event
         }.await;
 
-        if transport_registered {
-            handle
-                .state::<PortForwardState>()
-                .unregister_session(session_id, &handle.state::<SessionStore>());
-            if let Ok(mut cmds) = handle.state::<SshState>().fwd_commands.lock() {
-                cmds.remove(&session_id);
-            }
-        }
-        if register_port_forward_transport {
-            if let Ok(mut headless) = handle.state::<SshState>().headless_sessions.lock() {
-                headless.remove(&session_id);
-            }
-        }
         if let Ok(mut h) = handle.state::<SshState>().ssh_handles.lock() {
             h.remove(&sid);
         }
@@ -936,11 +787,9 @@ pub async fn connect_ssh(
     let (writer, resize_tx, abort_tx) = spawn_ssh_task(
         app.clone(),
         id.clone(),
-        session_id,
         cols,
         rows,
         connection_chain,
-        false,
         exit_requested.clone(),
     );
 
@@ -956,77 +805,6 @@ pub async fn connect_ssh(
     );
 
     Ok(())
-}
-
-pub async fn connect_ssh_headless(
-    session_id: i64,
-    key_passphrases: Option<Vec<KeyPassphraseInput>>,
-    master_pwd_state: &MasterPasswordState,
-    state: &SshState,
-    session_store: &SessionStore,
-    app: &AppHandle,
-) -> Result<(), String> {
-    if state
-        .fwd_commands
-        .lock()
-        .map_err(|e| e.to_string())?
-        .contains_key(&session_id)
-    {
-        return Ok(());
-    }
-
-    {
-        let mut headless = state.headless_sessions.lock().map_err(|e| e.to_string())?;
-        if !headless.insert(session_id) {
-            return Ok(());
-        }
-    }
-
-    let connection_chain = match resolve_connection_chain(
-        session_id,
-        master_pwd_state,
-        session_store,
-        None,
-        key_passphrases,
-    ) {
-        Ok(chain) => chain,
-        Err(err) => {
-            if let Ok(mut headless) = state.headless_sessions.lock() {
-                headless.remove(&session_id);
-            }
-            return Err(err);
-        }
-    };
-
-    let headless_id = headless_ssh_id(session_id);
-    let exit_requested = Arc::new(AtomicBool::new(false));
-    let (writer, resize_tx, abort_tx) = spawn_ssh_task(
-        app.clone(),
-        headless_id.clone(),
-        session_id,
-        80,
-        24,
-        connection_chain,
-        true,
-        exit_requested.clone(),
-    );
-
-    state.sessions.lock().map_err(|e| e.to_string())?.insert(
-        headless_id,
-        SshSession {
-            writer,
-            resize_tx,
-            abort: Some(abort_tx),
-            exit_requested,
-            session_id,
-        },
-    );
-
-    Ok(())
-}
-
-pub fn disconnect_headless_ssh(session_id: i64, state: &SshState) -> Result<(), String> {
-    disconnect_ssh_internal(&headless_ssh_id(session_id), state)
 }
 
 #[tauri::command]

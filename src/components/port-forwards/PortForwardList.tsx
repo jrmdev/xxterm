@@ -81,7 +81,7 @@ function PortForwardRow(props: Props & { forward: PortForward }) {
       </Show>
       <div style={{ flex: 1 }} />
       <Show when={err()}>
-        <span style={{ color: "var(--app-danger)", "font-size": "10px", "max-width": "120px", overflow: "hidden", "text-overflow": "ellipsis" }}>
+        <span role="alert" title={err() || undefined} style={{ color: "var(--app-danger)", "font-size": "10px", "max-width": "160px", overflow: "hidden", "text-overflow": "ellipsis" }}>
           {err()}
         </span>
       </Show>
